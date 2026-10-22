@@ -7,7 +7,9 @@
   var CFG_KEY = "klappe.cfg.v1";
   var CACHE_KEY = "klappe.cache.v1";
   var HINT_KEY = "klappe.hint.install";
-  var VERSION = "1.2";
+  var LOOKS_KEY = "klappe.looks.v1";
+  var HAPTIC_KEY = "klappe.haptics";
+  var VERSION = "1.3";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -16,7 +18,8 @@
     cfg: null, api: null, demo: false,
     tab: "home",
     status: null, runs: null, overrides: null, history: null, histFilter: null, histShown: 30,
-    loading: false, error: null, fetchedAt: null, fromCache: false,
+    loading: false, booting: false, error: null, fetchedAt: null, fromCache: false,
+    looks: {}, haptics: true,
     pending: {},
     sheet: null,
     toast: null,
@@ -40,6 +43,40 @@
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* egal */ } }
   function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { /* egal */ } }
 
+  /* ---------- Fellfarben und Vibration (nur auf diesem Handy gespeichert) ---------- */
+
+  function loadLooks() {
+    var raw = lsGet(LOOKS_KEY);
+    try { return L.sanitizeLooks(raw ? JSON.parse(raw) : {}); } catch (e) { return {}; }
+  }
+  function saveLooks() { lsSet(LOOKS_KEY, JSON.stringify(S.looks)); }
+  S.looks = loadLooks();
+  S.haptics = lsGet(HAPTIC_KEY) !== "0";
+
+  function canBuzz() { return typeof navigator.vibrate === "function"; }
+  function buzz(pattern) {
+    if (!S.haptics || !canBuzz()) return;
+    try { navigator.vibrate(pattern); } catch (e) { /* egal */ }
+  }
+
+  // Alle bekannten Tiernamen (Zeitplan und Sure-Cloud), ohne Doppelte
+  function allPetNames() {
+    var st = S.status || {}, seen = {}, out = [];
+    (st.cats || []).concat(st.pets || []).forEach(function (p) {
+      var k = String(p.name || "").trim().toLowerCase();
+      if (k && !seen[k]) { seen[k] = true; out.push(String(p.name).trim()); }
+    });
+    return out;
+  }
+  function lookOf(name) { return L.lookFor(S.looks, allPetNames(), name); }
+
+  // Rundes Gesicht; asleep zeigt geschlossene Augen und kleine z
+  function faceHtml(name, asleep, size, tint) {
+    var look = lookOf(name);
+    return '<span class="face-wrap"><span class="face' + (size ? " " + size : "") + '">' + L.faceSvg(look, !!asleep) + "</span>" +
+      (asleep ? '<span class="zzz" style="--cat-z:' + (tint || look.coat) + '" aria-hidden="true"><i>z</i><i>z</i><i>z</i></span>' : "") + "</span>";
+  }
+
   function clockNaive() {
     return L.nowNaive(S.status && S.status.timezone || L.DEFAULT_TZ);
   }
@@ -54,8 +91,7 @@
   }
 
   var I = {
-    moon: '<svg class="cat-icon" viewBox="0 0 48 48" fill="currentColor" aria-hidden="true"><path d="M41 30.5A18 18 0 0 1 17.5 7 18.5 18.5 0 1 0 41 30.5z"/></svg>',
-    sun: '<svg class="cat-icon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" aria-hidden="true"><circle cx="24" cy="24" r="8.5" fill="currentColor" stroke="none"/><path d="M24 4.5v6M24 37.5v6M4.5 24h6M37.5 24h6M10.2 10.2l4.2 4.2M33.6 33.6l4.2 4.2M10.2 37.8l4.2-4.2M33.6 14.4l4.2-4.2"/></svg>',
+    paw: '<svg class="paw" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><ellipse cx="12" cy="16.5" rx="5.2" ry="4.2"/><ellipse cx="5.4" cy="10.5" rx="2.1" ry="2.8" transform="rotate(-18 5.4 10.5)"/><ellipse cx="9.6" cy="5.8" rx="2.1" ry="2.9"/><ellipse cx="14.4" cy="5.8" rx="2.1" ry="2.9"/><ellipse cx="18.6" cy="10.5" rx="2.1" ry="2.8" transform="rotate(18 18.6 10.5)"/></svg>',
     home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 21V11a6.5 6.5 0 0 1 13 0v10"/><path d="M3 21h18"/><path d="M9.5 21v-5.5h5V21"/></svg>',
     clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5.2l3.5 2"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5.5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="18.5" cy="12" r="1.9"/></svg>',
@@ -104,6 +140,7 @@
     S.history = null; S.histFilter = null; S.histShown = 30;
     S.pending = {}; S.sheet = null; S.draft = null; S.saved = null; S.scheduleLoaded = false; S.scheduleError = null;
     S.tab = "home";
+    S.booting = false;
     if (!demo) {
       var cached = cacheLoad();
       if (cached) {
@@ -111,6 +148,7 @@
         S.history = Array.isArray(cached.history) ? cached.history : null;
       }
     }
+    S.booting = !S.status;
     render();
     return refresh(true);
   }
@@ -164,6 +202,7 @@
     S.fetchedAt = Date.now();
     S.fromCache = false;
     cacheSave();
+    if (window.KLTheme && window.KLTheme.setSun && S.status) window.KLTheme.setSun(S.status.sun, S.status.timezone);
     return res;
   }
 
@@ -178,6 +217,7 @@
       S.error = e;
     }
     S.loading = false;
+    S.booting = false;
     render();
   }
 
@@ -235,7 +275,7 @@
 
   function headerHtml() {
     var h = health();
-    return '<header class="top"><span class="brand">Katzenklappe</span>' +
+    return '<header class="top"><span class="brand"><span class="logo">' + L.faceSvg({ coat: "#FFF6DC", tabby: false, muzzle: true }, false) + "</span>Katzenklappe</span>" +
       '<span class="pill" data-tone="' + h.tone + '"><span class="dot"></span>' + esc(h.label) + "</span></header>";
   }
 
@@ -307,9 +347,13 @@
   }
 
   // Tagesleiste: gesperrte Abschnitte (Liste in Prozent), Jetzt-Markierung (oder null), Text darunter
-  function barHtml(segs, nowPct, caption) {
+  function ticksHtml() {
+    return '<div class="bar-ticks" aria-hidden="true"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>';
+  }
+  function barHtml(segs, nowPct, caption, ticks) {
     return '<div class="bar"><div class="bar-track">' + segHtml(segs) + "</div>" +
-      (nowPct == null ? "" : '<span class="bar-now" style="left:' + nowPct.toFixed(3) + '%"></span>') + "</div>" +
+      (nowPct == null ? "" : '<span class="bar-now" style="--p:' + nowPct.toFixed(3) + '"></span>') + "</div>" +
+      (ticks ? ticksHtml() : "") +
       (caption ? '<p class="bar-caption">' + esc(caption) + "</p>" : "");
   }
 
@@ -318,10 +362,10 @@
     var day = naive.slice(0, 10);
     if (c.plan) {
       return barHtml(L.planSegments(c.plan, day), L.nowPercent(naive),
-        L.planCaption(c.plan, day, c.lock && c.unlock ? [c.lock, c.unlock] : null));
+        L.planCaption(c.plan, day, c.lock && c.unlock ? [c.lock, c.unlock] : null), true);
     }
     if (c.lock && c.unlock) {
-      return barHtml(L.barSegments(c.lock, c.unlock), L.nowPercent(naive), "Gesperrt von " + c.lock + " bis " + c.unlock + " Uhr");
+      return barHtml(L.barSegments(c.lock, c.unlock), L.nowPercent(naive), "Gesperrt von " + c.lock + " bis " + c.unlock + " Uhr", true);
     }
     return "";
   }
@@ -344,7 +388,7 @@
     return '<div class="busy" role="status"><p class="busy-text">' + esc(t[0]) + "</p>" +
       (t[1] ? '<p class="busy-sub">' + esc(t[1]) + "</p>" : "") +
       (done ? '<div class="cat-actions"><button class="cat-btn" data-action="dismiss-pending" data-key="' + esc(key) + '">Schließen</button></div>'
-        : '<div class="progress"></div>') + "</div>";
+        : '<div class="paws" aria-hidden="true">' + I.paw + I.paw + I.paw + I.paw + "</div>") + "</div>";
   }
 
   // Gespeicherte Sonderregel (Variable) eines Tiers, falls noch nicht abgelaufen
@@ -387,11 +431,17 @@
     var d = L.describeCat(c, naive, descOpts());
     var activity = L.activityLine(activityOf(c));
     var p = S.pending[c.name];
-    var html = '<section class="cat" data-tone="' + d.tone + '" aria-label="' + esc(c.name) + '">' +
-      '<div class="cat-head"><h2 class="cat-name">' + esc(c.name) + "</h2>" + (d.tone === "night" ? I.moon : I.sun) + "</div>" +
-      '<p class="cat-state">' + esc(d.headline) + "</p>" +
-      (d.sub ? '<p class="cat-sub">' + esc(d.sub) + "</p>" : "") +
-      (d.locationText ? '<p class="cat-where">' + esc(d.locationText) + "</p>" : "") +
+    var o = descOpts(), asleep = d.tone === "night", look = lookOf(c.name);
+    var where = d.location === "inside" ? "Drinnen" : d.location === "outside" ? "Draußen" : "";
+    var since = where && c.location_since ? " " + L.sinceLabel(c.location_since, o.tz, o.nowMs) : "";
+    var sub = d.sub;
+    if (!sub && !asleep && Array.isArray(c.rules) && !c.rules.length) sub = "Kein Zeitplan: immer frei";
+    var html = '<section class="cat" data-tone="' + d.tone + '" style="--coat:' + look.coat + '" aria-label="' + esc(c.name) + '">' +
+      '<div class="cat-head">' + faceHtml(c.name, asleep, "") + '<div class="cat-id"><h2 class="cat-name">' + esc(c.name) + "</h2>" +
+      (where ? '<p class="cat-where">' + esc(where + since) + "</p>" : "") + "</div></div>" +
+      '<div class="state">' + (asleep ? I.lock : I.unlock) + '<div class="state-text"><span class="cat-state">' + esc(d.headline) + "</span>" +
+      (sub ? '<span class="cat-sub">' + esc(sub) + "</span>" : "") + "</div></div>" +
+      (d.location === "outside" && asleep ? '<p class="cat-note">' + esc(c.name) + " ist noch draußen und kann nur noch hinein.</p>" : "") +
       (activity ? '<p class="cat-activity">' + esc(activity) + "</p>" : "") +
       catBarHtml(c, naive) +
       (d.override ? '<p class="cat-override">' + esc(d.overrideLabel) + "</p>" : "");
@@ -408,6 +458,16 @@
     return html + "</section>";
   }
 
+  function skeletonHtml() {
+    var one = '<section class="cat skel" aria-hidden="true"><div class="cat-head"><span class="face-wrap"><span class="face"></span></span>' +
+      '<div class="cat-id" style="flex:1"><div class="skel-line w1"></div><div class="skel-line w2"></div></div></div>' +
+      '<div class="skel-line w3"></div><div class="skel-line w4"></div></section>';
+    return '<div role="status" aria-label="Wird geladen">' + one + one + "</div>";
+  }
+  function loadingCardHtml() {
+    return '<div class="card" role="status" aria-label="Wird geladen"><div class="skel-line w1"></div><div class="skel-line w2"></div><div class="skel-line w4"></div></div>';
+  }
+
   function bulkHtml() {
     var st = S.status;
     if (!st || (st.cats || []).length < 2) return "";
@@ -416,7 +476,7 @@
     return '<section class="card" aria-label="Alle Tiere"><h2 class="card-title">Alle Tiere</h2>' +
       '<p class="card-sub">Gilt für alle Tiere mit Zeitplan auf einmal.</p>' +
       (p ? busyHtml("__bulk", p)
-        : '<div class="cat-actions"><button class="cat-btn" data-action="open-bulk" data-locked="1">Alle drinnen lassen</button>' +
+        : '<div class="cat-actions two"><button class="cat-btn" data-action="open-bulk" data-locked="1">Alle drinnen lassen</button>' +
           '<button class="cat-btn" data-action="open-bulk" data-locked="0">Alle rauslassen</button>' +
           (any ? '<button class="cat-link" data-action="clear-all-overrides">Für alle den Zeitplan wieder gelten lassen</button>' : "") + "</div>") +
       "</section>";
@@ -451,9 +511,9 @@
         var where = p.location === "inside" ? "drinnen" : p.location === "outside" ? "draußen" : "";
         var since = where && p.location_since ? " " + L.sinceLabel(p.location_since, o.tz, o.nowMs) : "";
         var act = L.activityLine(activityOf(p));
-        return '<li class="pet-row"><span class="pet-dot" data-where="' + esc(p.location || "unknown") + '"></span><div>' +
+        return '<li class="pet-row">' + faceHtml(p.name, false, "face-md") + "<div>" +
           "<strong>" + esc(p.name) + "</strong>" +
-          '<span class="pet-where">' + (where ? esc(where + since) : "Ort unbekannt") + "</span>" +
+          '<span class="pet-where">' + (where ? esc(where.charAt(0).toUpperCase() + where.slice(1) + since) : "Ort unbekannt") + "</span>" +
           (act ? '<span class="pet-act">' + esc(act) + "</span>" : "") + "</div></li>";
       }).join("") + "</ul></section>";
   }
@@ -495,6 +555,7 @@
   function viewHome() {
     var naive = clockNaive();
     var cats = (S.status && S.status.cats) || [];
+    if (!S.status && S.booting && !S.error) return headerHtml() + skeletonHtml();
     var html = headerHtml() + bannersHtml() + vacationNoteHtml(naive);
     cats.forEach(function (c) { html += catCardHtml(c, naive); });
     html += bulkHtml() + othersHtml() + devicesHtml();
@@ -548,7 +609,7 @@
     return '<section class="card" aria-label="Draußen pro Tag, ' + esc(name) + '"><h2 class="card-title">' + esc(name) + ": Zeit draußen</h2>" +
       '<p class="card-sub">Pro Tag, die letzten 7 Tage' +
       (known >= 2 ? ". Im Schnitt " + esc(L.durationLabel(total / known).replace(/\.$/, "")) + " am Tag." : ". Der Verlauf füllt sich mit jedem Tag.") +
-      '</p><ol class="week">' + cols + "</ol></section>";
+      '</p><ol class="week" style="--coat:' + lookOf(name).coat + '">' + cols + "</ol></section>";
   }
 
   function eventRowHtml(r) {
@@ -563,7 +624,7 @@
     var html = '<h1 class="page-title">Verlauf</h1>';
     if (!S.status && !S.history) {
       return html + (S.error ? noteHtml("bad", "Der Verlauf konnte nicht geladen werden.", [L.errorText(S.error)],
-        '<button class="note-btn" data-action="refresh">Nochmal versuchen</button>') : '<p class="muted">Wird geladen …</p>');
+        '<button class="note-btn" data-action="refresh">Nochmal versuchen</button>') : loadingCardHtml());
     }
     if (!S.history) {
       return html + noteHtml("info", "Der Verlauf ist noch nicht da.", ["Er wird mit dem nächsten Aktualisieren geladen."],
@@ -705,7 +766,7 @@
     var today = naive.slice(0, 10);
     if (mode === "daily") {
       var simple = L.isHHMM(c.lock) && L.isHHMM(c.unlock) ? [c.lock, c.unlock] : null;
-      return barHtml(L.planSegments(plan, today), L.nowPercent(naive), L.planCaption(plan, today, simple));
+      return barHtml(L.planSegments(plan, today), L.nowPercent(naive), L.planCaption(plan, today, simple), true);
     }
     var rows = "";
     for (var d = 0; d < 7; d++) {
@@ -713,6 +774,7 @@
       rows += '<div class="wp-row"><span class="wp-day">' + (d === 0 ? "Heute" : L.DAY_ABBR[L.weekdayOf(day)]) + "</span>" +
         barHtml(L.planSegments(plan, day), d === 0 ? L.nowPercent(naive) : null, "") + "</div>";
     }
+    rows += '<div class="wp-axis"><span></span>' + ticksHtml() + "</div>";
     return '<div class="wp" role="img" aria-label="Wochenübersicht der Sperrzeiten">' + rows + "</div>" +
       '<p class="bar-caption">' + esc(L.planCaption(plan, today)) + "</p>";
   }
@@ -729,8 +791,9 @@
     }
     return '<section class="cat-edit">' +
       '<label class="sr" for="n' + i + '">Name des Tiers</label>' +
-      '<input class="name-input" id="n' + i + '" data-field="name" data-idx="' + i + '" value="' + esc(c.name) + '" placeholder="Name" autocomplete="off" autocapitalize="words" spellcheck="false">' +
-      '<p style="color:var(--ink-2);font-size:14px;margin-top:6px">Genau so geschrieben wie in der Sure-App.</p>' +
+      '<div class="edit-head">' + faceHtml(c.name.trim(), false, "face-sm") +
+      '<input class="name-input" id="n' + i + '" data-field="name" data-idx="' + i + '" value="' + esc(c.name) + '" placeholder="Name" autocomplete="off" autocapitalize="words" spellcheck="false"></div>' +
+      '<p class="name-hint">Genau so geschrieben wie in der Sure-App.</p>' +
       modeSwitchHtml(c, i) + body +
       '<div class="preview" data-preview="' + i + '">' + previewHtml(c, naive) + "</div>" +
       '<div class="stack"><button class="btn-text btn-text-danger" data-action="remove-cat" data-idx="' + i + '">Tier entfernen</button></div>' +
@@ -881,7 +944,7 @@
       return html + (S.scheduleError
         ? noteHtml("bad", "Die Zeiten konnten nicht geladen werden.", [L.errorText(S.scheduleError)],
             '<button class="note-btn" data-action="retry-times">Nochmal versuchen</button>')
-        : '<p style="color:var(--ink-2)">Wird geladen …</p>');
+        : loadingCardHtml());
     }
     var naive = clockNaive();
     html += '<div id="times-status">' + timesStatusHtml() + "</div>";
@@ -908,6 +971,29 @@
     }).join("") + "</ul>";
   }
 
+  var THEME_CHOICES = [["auto", "Automatisch"], ["system", "Wie das Handy"], ["day", "Immer Tag"], ["night", "Immer Nacht"]];
+
+  function looksHtml() {
+    var mode = window.KLTheme && window.KLTheme.getMode ? window.KLTheme.getMode() : "auto";
+    var names = allPetNames().sort(function (a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1; });
+    var html = '<section class="section"><h2>Aussehen</h2>' +
+      "<p>Automatisch heißt: gelb am Tag, violett in der Nacht (nach Sonnenauf- und -untergang, wenn unter „Zeiten“ ein Standort eingestellt ist). Alles hier gilt nur für dieses Handy.</p>" +
+      '<div class="sel-row"><label for="theme-mode">Farbwelt</label><select class="select select-wide" id="theme-mode" data-theme-mode="1">' +
+      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>";
+    if (names.length) {
+      html += '<p class="form-label">Fellfarben</p><ul class="look-list">' + names.map(function (n) {
+        var lk = lookOf(n);
+        return '<li class="look-row">' + faceHtml(n, false, "face-sm") + "<strong>" + esc(n) + "</strong>" +
+          '<button class="btn-text" data-action="look-open" data-name="' + esc(n) + '" aria-label="Aussehen von ' + esc(n) + ' ändern">' + esc(L.coatName(lk.coat)) + " ändern</button></li>";
+      }).join("") + "</ul>";
+    }
+    if (canBuzz()) {
+      html += '<div class="switch-row switch-flush"><div><strong>Kurzes Vibrieren beim Tippen</strong></div>' +
+        '<label class="switch"><span class="sr">Kurzes Vibrieren beim Tippen</span><input type="checkbox" id="haptics" data-haptics="1"' + (S.haptics ? " checked" : "") + "><span></span></label></div>";
+    }
+    return html + "</section>";
+  }
+
   function viewMore() {
     var html = '<h1 class="page-title">Mehr</h1>';
     if (S.demo) {
@@ -919,6 +1005,7 @@
       '<div class="stack"><button class="btn btn-quiet" data-action="diag">Verbindung testen</button>' +
       (S.demo ? "" : '<button class="btn btn-quiet" data-action="run-now">Zeitplan jetzt ausführen</button>') + "</div>" +
       diagHtml() + "</section>";
+    html += looksHtml();
     if (!S.demo) {
       html += '<section class="section"><h2>Zweite Person einladen</h2>' +
         "<p>Der Link richtet die App auf einem anderen Handy ein, ohne dass dort etwas getippt werden muss. Er enthält den Zugangsschlüssel: nur an Personen schicken, denen du vertraust.</p>" +
@@ -956,7 +1043,7 @@
   /* ----- Einrichten ----- */
 
   function viewSetup() {
-    return '<div class="welcome"><h1>Katzenklappe</h1>' +
+    return '<div class="welcome"><span class="hello">' + L.faceSvg({ coat: "#FFF6DC", tabby: false, muzzle: true }, false) + "</span><h1>Katzenklappe</h1>" +
       '<p class="lead">Zeitplan für jede Katze einzeln.</p>' +
       (S.setupError ? '<p class="err" role="alert">' + esc(S.setupError) + "</p>" : "") +
       '<section class="section"><h2>Einrichtungs-Link einfügen</h2>' +
@@ -986,6 +1073,17 @@
           return '<button class="opt" data-action="choose-pet" data-idx="' + i + '"><strong>' + esc(n) + "</strong></button>";
         }).join("") +
         '<button class="opt" data-action="choose-pet" data-idx="-1"><strong>Anderer Name …</strong><small>Zum Eintippen</small></button>';
+    } else if (sh.kind === "look") {
+      var lk = lookOf(sh.name);
+      inner = "<h2>" + esc(sh.name) + '</h2><div class="look-preview">' + faceHtml(sh.name, false, "face-lg") +
+        "<p>" + esc(L.coatName(lk.coat)) + "</p></div>" +
+        '<div class="swatches" role="group" aria-label="Fellfarbe">' + L.COATS.map(function (c) {
+          return '<button class="swatch" data-action="look-coat" data-color="' + c.hex + '" style="--c:' + c.hex + '" aria-pressed="' + (c.hex === lk.coat) +
+            '" aria-label="' + esc(c.name) + '">' + I.ok + "</button>";
+        }).join("") + "</div>" +
+        '<div class="look-toggles"><button class="chip" data-action="look-toggle" data-prop="tabby" aria-pressed="' + lk.tabby + '">Streifen<span>' + (lk.tabby ? "an" : "aus") + "</span></button>" +
+        '<button class="chip" data-action="look-toggle" data-prop="muzzle" aria-pressed="' + lk.muzzle + '">Weiße Schnauze<span>' + (lk.muzzle ? "an" : "aus") + "</span></button></div>" +
+        '<button class="opt look-done" data-action="close-sheet"><strong>Fertig</strong></button>';
     } else if (sh.kind === "bulk") {
       inner = "<h2>" + (sh.wantLocked ? "Alle drinnen lassen" : "Alle rauslassen") + "</h2>" +
         '<p class="sheet-sub">' + esc(sh.wantLocked
@@ -1006,7 +1104,7 @@
         }).join("");
     }
     return '<div class="scrim" data-action="close-sheet"><div class="sheet" role="dialog" aria-modal="true" aria-label="Auswahl">' + inner +
-      '<button class="opt opt-cancel" data-action="close-sheet"><strong>Abbrechen</strong></button></div></div>';
+      (sh.kind === "look" ? "" : '<button class="opt opt-cancel" data-action="close-sheet"><strong>Abbrechen</strong></button>') + "</div></div>";
   }
 
   function toastHtml() {
@@ -1036,7 +1134,7 @@
     }
     $app.innerHTML = html + sheetHtml() + toastHtml();
     var focus = $app.querySelector(".sheet .opt");
-    if (S.sheet && focus) focus.focus();
+    if (S.sheet && S.sheet.kind !== "look" && focus) focus.focus();
   }
 
   function updateScheduleUi() {
@@ -1077,12 +1175,12 @@
     try {
       await S.api.dispatch();
     } catch (e) {
-      token.phase = "nodispatch"; token.error = e; render();
+      token.phase = "nodispatch"; token.error = e; buzz([70, 50, 70]); render();
       return;
     }
     token.phase = "waiting"; render();
     while (S.pending[key] === token) {
-      if (Date.now() - t0 > WAIT_MAX_MS) { token.phase = "slow"; render(); return; }
+      if (Date.now() - t0 > WAIT_MAX_MS) { token.phase = "slow"; buzz([70, 50, 70]); render(); return; }
       await sleep(POLL_MS);
       if (S.pending[key] !== token) return;
       try {
@@ -1090,10 +1188,11 @@
         S.error = null;
         if (isDone(S.status)) {
           delete S.pending[key];
+          buzz([20, 60, 20]);
           toast(typeof doneText === "function" ? doneText(S.status) : doneText);
           return;
         }
-        if (failedSince(res[1], t0 - 60000)) { token.phase = "failed"; render(); return; }
+        if (failedSince(res[1], t0 - 60000)) { token.phase = "failed"; buzz([70, 50, 70]); render(); return; }
       } catch (e) {
         /* kurzer Netzfehler: weiter versuchen, bis die Zeit um ist */
       }
@@ -1387,7 +1486,18 @@
     if (!el) return;
     if (el.classList.contains("scrim") && ev.target !== el) return; // Klick im Dialog selbst schließt nicht
     var a = el.dataset.action;
+    if (a !== "close-sheet" || ev.target.closest(".opt")) buzz(10);
     switch (a) {
+      case "look-open": S.sheet = { kind: "look", name: el.dataset.name }; render(); break;
+      case "look-coat": case "look-toggle": {
+        var lsh = S.sheet; if (!lsh || lsh.kind !== "look") return;
+        var key = lsh.name.trim().toLowerCase(), cur = lookOf(lsh.name), next = { coat: cur.coat, tabby: cur.tabby, muzzle: cur.muzzle };
+        if (a === "look-coat") next.coat = el.dataset.color; else next[el.dataset.prop] = !next[el.dataset.prop];
+        S.looks[key] = L.normalizeLook(next, cur);
+        saveLooks();
+        render();
+        break;
+      }
       case "nav":
         S.tab = el.dataset.tab; render(true); window.scrollTo(0, 0); break;
       case "goto-times": S.tab = "times"; render(true); window.scrollTo(0, 0); break;
@@ -1520,6 +1630,19 @@
   });
   $app.addEventListener("change", function (ev) {
     var t = ev.target;
+    if (t.dataset && t.dataset.themeMode) {
+      if (window.KLTheme) window.KLTheme.setMode(t.value);
+      render(true);
+      var tm = document.getElementById("theme-mode");
+      if (tm) tm.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.haptics) {
+      S.haptics = !!t.checked;
+      lsSet(HAPTIC_KEY, S.haptics ? "1" : "0");
+      buzz(20);
+      return;
+    }
     if (t.dataset && t.dataset.when && S.draft) { changeWhen(t); return; }
     if (t.dataset && t.dataset.loc === "city" && S.draft) {
       var val = t.value;
@@ -1556,9 +1679,11 @@
   window.addEventListener("beforeinstallprompt", function (ev) { ev.preventDefault(); S.installEvt = ev; render(); });
   window.addEventListener("appinstalled", function () { S.installEvt = null; lsSet(HINT_KEY, "1"); render(); });
   document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && window.KLTheme) window.KLTheme.apply();
     if (!document.hidden && S.api && (!S.fetchedAt || Date.now() - S.fetchedAt > 30000)) refresh(true);
   });
   setInterval(function () {
+    if (window.KLTheme && !document.hidden) window.KLTheme.apply();
     if (document.hidden || !S.api) return;
     if ((S.tab === "home" || S.tab === "history") && !S.sheet) {
       if (!S.fetchedAt || Date.now() - S.fetchedAt > 300000) refresh(true); else render();

@@ -1,9 +1,9 @@
 /* Katzenklappe - Offline-Hülle: die App-Dateien kommen sofort aus dem Speicher und werden im Hintergrund aufgefrischt.
  * Anfragen an GitHub werden nie zwischengespeichert. */
-const CACHE = "klappe-v3";
+const CACHE = "klappe-v4";
 const SHELL = [
-  "./", "index.html", "style.css", "logic.js", "api.js", "demo.js", "app.js", "manifest.webmanifest",
-  "fonts/bricolage-grotesque-wdth.woff2", "icons/icon-192.png", "icons/icon-512.png"
+  "./", "index.html", "style.css", "theme.js", "logic.js", "looks.js", "api.js", "demo.js", "app.js", "manifest.webmanifest",
+  "fonts/fredoka-latin-wght-normal.woff2", "icons/icon-192.png", "icons/icon-512.png"
 ];
 
 self.addEventListener("install", (event) => {
