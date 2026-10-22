@@ -58,6 +58,242 @@
   function isHHMM(v) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(v || ""); }
   function minutesOfDay(hhmm) { var p = hhmm.split(":"); return (+p[0]) * 60 + (+p[1]); }
 
+  /* ---------- Plan: Wochentage, Sonne, Urlaub (Gegenstueck zu plan.py) ---------- */
+
+  var MAX_OFFSET = 240;
+  var SUN_FALLBACK = { sunrise: "06:00", sunset: "18:00" };
+  var DAY_NAMES = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
+  var DAY_ABBR = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
+
+  // 'HH:MM' | 'sunrise' | 'sunset' (+/- Minuten) -> {kind:'clock', t} | {kind:'sun', ev, off} | null
+  function parseWhen(value) {
+    var text = String(value == null ? "" : value).replace(/\s+/g, "").toLowerCase();
+    var m = /^(\d{1,2}):(\d{2})$/.exec(text);
+    if (m) {
+      var h = +m[1], mi = +m[2];
+      return h > 23 || mi > 59 ? null : { kind: "clock", t: pad(h) + ":" + pad(mi) };
+    }
+    m = /^(sunrise|sunset)([+-]\d{1,3})?$/.exec(text);
+    if (m) {
+      var off = m[2] ? parseInt(m[2], 10) : 0;
+      return Math.abs(off) > MAX_OFFSET ? null : { kind: "sun", ev: m[1], off: off };
+    }
+    return null;
+  }
+  function whenText(w) {
+    if (!w) return "";
+    return w.kind === "clock" ? w.t : w.ev + (w.off ? (w.off > 0 ? "+" : "-") + Math.abs(w.off) : "");
+  }
+  function canonWhen(value) { var w = parseWhen(value); return w ? whenText(w) : null; }
+  function isWhen(value) { return !!parseWhen(value); }
+  function whenKind(value) { var w = parseWhen(value); return !w ? "clock" : w.kind === "clock" ? "clock" : w.ev; }
+  function whenOffset(value) { var w = parseWhen(value); return w && w.kind === "sun" ? w.off : 0; }
+  function whenWith(kind, offset, clockValue) {
+    if (kind === "clock") return parseWhen(clockValue) ? canonWhen(clockValue) : "22:00";
+    return kind + (offset ? (offset > 0 ? "+" : "-") + Math.abs(offset) : "");
+  }
+  // Text fuer Menschen: "22:00 Uhr", "Sonnenuntergang", "30 Min. nach Sonnenuntergang"
+  function whenLabelText(value) {
+    var w = parseWhen(value);
+    if (!w) return "";
+    if (w.kind === "clock") return w.t + " Uhr";
+    var name = w.ev === "sunrise" ? "Sonnenaufgang" : "Sonnenuntergang";
+    if (!w.off) return name;
+    return Math.abs(w.off) + " Min. " + (w.off > 0 ? "nach " : "vor ") + name;
+  }
+
+  /* Sonnenstand nach dem NOAA-Verfahren; muss dasselbe rechnen wie plan.py (wird gegeneinander getestet). */
+  function sunPosition(jd) {
+    var rad = Math.PI / 180, deg = 180 / Math.PI;
+    var t = (jd - 2451545.0) / 36525.0;
+    var l0 = (280.46646 + t * (36000.76983 + t * 0.0003032)) % 360.0;
+    if (l0 < 0) l0 += 360;
+    var m = 357.52911 + t * (35999.05029 - 0.0001537 * t);
+    var e = 0.016708634 - t * (0.000042037 + 0.0000001267 * t);
+    var mr = m * rad;
+    var c = Math.sin(mr) * (1.914602 - t * (0.004817 + 0.000014 * t)) +
+      Math.sin(2 * mr) * (0.019993 - 0.000101 * t) + Math.sin(3 * mr) * 0.000289;
+    var trueLong = l0 + c;
+    var omega = 125.04 - 1934.136 * t;
+    var appLong = trueLong - 0.00569 - 0.00478 * Math.sin(omega * rad);
+    var meanObliq = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
+    var obliq = meanObliq + 0.00256 * Math.cos(omega * rad);
+    var decl = Math.asin(Math.sin(obliq * rad) * Math.sin(appLong * rad)) * deg;
+    var y = Math.pow(Math.tan(obliq * rad / 2.0), 2);
+    var l0r = l0 * rad;
+    var eq = 4.0 * deg * (y * Math.sin(2 * l0r) - 2 * e * Math.sin(mr) + 4 * e * y * Math.sin(mr) * Math.cos(2 * l0r) -
+      0.5 * y * y * Math.sin(4 * l0r) - 1.25 * e * e * Math.sin(2 * mr));
+    return { decl: decl, eq: eq };
+  }
+
+  function sunEventMinutes(dayMs, lat, lon, rising) {
+    var rad = Math.PI / 180, deg = 180 / Math.PI;
+    var jd0 = dayMs / 86400000 + 2440587.5;
+    var minutes = 720.0 - 4.0 * lon;
+    for (var i = 0; i < 2; i++) {
+      var pos = sunPosition(jd0 + minutes / 1440.0);
+      var cosHa = Math.cos(90.833 * rad) / (Math.cos(lat * rad) * Math.cos(pos.decl * rad)) -
+        Math.tan(lat * rad) * Math.tan(pos.decl * rad);
+      if (cosHa > 1.0 || cosHa < -1.0) return null;
+      var ha = Math.acos(cosHa) * deg;
+      minutes = 720.0 - 4.0 * (lon + (rising ? ha : -ha)) - pos.eq;
+    }
+    return minutes;
+  }
+
+  // [Sonnenaufgang, Sonnenuntergang] als "YYYY-MM-DDTHH:MM" (Ortszeit), auf die Minute gerundet; null, wenn es keinen gibt
+  function sunTimes(day, lat, lon, tz) {
+    var p = /^(\d{4})-(\d{2})-(\d{2})/.exec(day);
+    var dayMs = Date.UTC(+p[1], +p[2] - 1, +p[3]);
+    return [true, false].map(function (rising) {
+      var minutes = sunEventMinutes(dayMs, lat, lon, rising);
+      if (minutes === null) return null;
+      return nowNaive(tz, new Date(dayMs + Math.floor(minutes + 0.5) * 60000));
+    });
+  }
+
+  function weekdayOf(day) { // 0 = Montag ... 6 = Sonntag
+    var p = /^(\d{4})-(\d{2})-(\d{2})/.exec(day);
+    return (new Date(Date.UTC(+p[1], +p[2] - 1, +p[3])).getUTCDay() + 6) % 7;
+  }
+
+  function resolveWhen(value, day, loc, tz, problems) {
+    var w = parseWhen(value);
+    if (w.kind === "clock") return day.slice(0, 10) + "T" + w.t;
+    if (!loc) throw new Error("Für Sonnenauf-/untergang fehlt der Standort.");
+    var st = sunTimes(day, loc.lat, loc.lon, tz);
+    var base = w.ev === "sunrise" ? st[0] : st[1];
+    if (base === null) {
+      var msg = "Am " + day.slice(8, 10) + "." + day.slice(5, 7) + "." + day.slice(0, 4) + " gibt es hier keinen Sonnen" +
+        (w.ev === "sunrise" ? "auf" : "unter") + "gang; ersatzweise " + SUN_FALLBACK[w.ev] + " Uhr.";
+      if (problems && problems.indexOf(msg) < 0) problems.push(msg);
+      base = day.slice(0, 10) + "T" + SUN_FALLBACK[w.ev];
+    }
+    return addMinutes(base, w.off);
+  }
+
+  // Regeln eines Tieres aus dem Zeitplan-Eintrag: [{days, lock, unlock}] (kanonisch); alt: lock/unlock = jeden Tag
+  function catRules(cat) {
+    if (Array.isArray(cat.rules)) {
+      return cat.rules.map(function (r) {
+        var days = Array.isArray(r.days) ? r.days : [0, 1, 2, 3, 4, 5, 6];
+        var set = {}, out = [];
+        days.forEach(function (d) { if (typeof d === "number" && d >= 0 && d <= 6 && !set[d]) { set[d] = true; out.push(d); } });
+        out.sort(function (a, b) { return a - b; });
+        return { days: out, lock: canonWhen(r.lock) || String(r.lock || ""), unlock: canonWhen(r.unlock) || String(r.unlock || "") };
+      });
+    }
+    return [{ days: [0, 1, 2, 3, 4, 5, 6], lock: canonWhen(cat.lock) || String(cat.lock || ""), unlock: canonWhen(cat.unlock) || String(cat.unlock || "") }];
+  }
+  function sameRules(a, b) { return JSON.stringify(a || []) === JSON.stringify(b || []); }
+  function isSimpleRules(rules) {
+    return rules.length === 1 && rules[0].days.length === 7 && parseWhen(rules[0].lock) && parseWhen(rules[0].unlock) &&
+      parseWhen(rules[0].lock).kind === "clock" && parseWhen(rules[0].unlock).kind === "clock";
+  }
+  function usesSun(rules) {
+    return rules.some(function (r) {
+      var a = parseWhen(r.lock), b = parseWhen(r.unlock);
+      return (a && a.kind === "sun") || (b && b.kind === "sun");
+    });
+  }
+
+  // Urlaubszeitraeume fuer ein Tier: [[von, bis(exklusiv), gesperrt]]
+  function vacationZones(vacations, name) {
+    var key = String(name).trim().toLowerCase(), out = [];
+    (vacations || []).forEach(function (v) {
+      var cats = (v.cats || []).map(function (c) { return String(c).trim().toLowerCase(); });
+      if (!cats.length || cats.indexOf(key) >= 0) {
+        out.push([v.from + "T00:00", addDays(v.to + "T00:00", 1), v.state === "locked"]);
+      }
+    });
+    return out;
+  }
+
+  // Gesperrte Zeitraeume fuer [firstDay 00:00, firstDay + days 00:00): {start, end, locked: [[von, bis]], problems}
+  function buildPlan(rules, zones, firstDay, days, loc, tz) {
+    var problems = [];
+    var start = firstDay + "T00:00", end = addDays(start, days);
+    var windows = [];
+    for (var i = -2; i <= days; i++) {
+      var day = addDays(start, i).slice(0, 10), wd = weekdayOf(day);
+      rules.forEach(function (r) {
+        if (r.days.indexOf(wd) < 0) return;
+        var a = resolveWhen(r.lock, day, loc, tz, problems), b = resolveWhen(r.unlock, day, loc, tz, problems);
+        if (b <= a) b = resolveWhen(r.unlock, addDays(day + "T00:00", 1).slice(0, 10), loc, tz, problems);
+        if (b > a) windows.push([a, b]);
+      });
+    }
+    function lockedAt(t) {
+      var hits = zones.filter(function (z) { return z[0] <= t && t < z[1]; });
+      if (hits.length) return hits.some(function (z) { return z[2]; });
+      return windows.some(function (w) { return w[0] <= t && t < w[1]; });
+    }
+    var set = {};
+    set[start] = true; set[end] = true;
+    windows.forEach(function (w) { set[w[0]] = true; set[w[1]] = true; });
+    zones.forEach(function (z) { set[z[0]] = true; set[z[1]] = true; });
+    var points = Object.keys(set).filter(function (p) { return p >= start && p <= end; }).sort();
+    var intervals = [];
+    for (var k = 0; k + 1 < points.length; k++) {
+      if (lockedAt(points[k])) {
+        var last = intervals[intervals.length - 1];
+        if (last && last[1] === points[k]) last[1] = points[k + 1];
+        else intervals.push([points[k], points[k + 1]]);
+      }
+    }
+    return { start: start, end: end, locked: intervals, problems: problems };
+  }
+
+  function planCovers(plan, naive) { return !!plan && naive >= plan.start && naive < plan.end; }
+  function planLockedAt(plan, naive) {
+    return plan.locked.some(function (w) { return w[0] <= naive && naive < w[1]; });
+  }
+  // echte Wechsel (ohne die Raender des Zeitraums): [{at, to}]
+  function planBoundaries(plan) {
+    var out = [];
+    plan.locked.forEach(function (w) {
+      if (w[0] > plan.start) out.push({ at: w[0], to: "locked" });
+      if (w[1] < plan.end) out.push({ at: w[1], to: "free" });
+    });
+    return out;
+  }
+  function planNextChange(plan, naive) {
+    var list = planBoundaries(plan);
+    for (var i = 0; i < list.length; i++) if (list[i].at > naive) return list[i];
+    return null;
+  }
+
+  // gesperrte Abschnitte eines Kalendertages in Prozent der 24 Stunden: [{from, to}]
+  function planSegments(plan, day) {
+    var a = day.slice(0, 10) + "T00:00", b = addDays(a, 1), out = [];
+    ((plan && plan.locked) || []).forEach(function (w) {
+      var from = w[0] > a ? w[0] : a, to = w[1] < b ? w[1] : b;
+      if (from < to) out.push({ from: minutesBetween(a, from) / 14.4, to: minutesBetween(a, to) / 14.4, a: from, b: to });
+    });
+    return out;
+  }
+
+  // "Gesperrt heute: bis 05:11 und ab 19:41 Uhr."
+  function planCaption(plan, day, simple) {
+    var a = day.slice(0, 10) + "T00:00", b = addDays(a, 1);
+    var segs = planSegments(plan, day);
+    if (!segs.length) return "Heute nicht gesperrt.";
+    if (segs.length === 1 && segs[0].a === a && segs[0].b === b) return "Heute durchgehend gesperrt.";
+    if (simple) {
+      var plain = barSegments(simple[0], simple[1]);
+      var same = plain.length === segs.length && plain.every(function (p, i) {
+        return Math.abs(p.from - segs[i].from) < 0.01 && Math.abs(p.to - segs[i].to) < 0.01;
+      });
+      if (same) return "Gesperrt von " + simple[0] + " bis " + simple[1] + " Uhr";
+    }
+    var parts = segs.map(function (s) {
+      if (s.a === a) return "bis " + timeOf(s.b);
+      if (s.b === b) return "ab " + timeOf(s.a);
+      return timeOf(s.a) + "–" + timeOf(s.b);
+    });
+    return "Gesperrt heute: " + parts.join(" und ") + " Uhr";
+  }
+
   /* ---------- Zeitplan ---------- */
 
   // Soll laut Zeitplan: gesperrt zwischen lock und unlock (darf ueber Mitternacht gehen)
@@ -83,19 +319,32 @@
     return o && naive < o.until ? o : null;
   }
 
+  // Soll laut Zeitplan (Wochenplan und Urlaub) zu diesem Zeitpunkt. Bevorzugt der vorberechnete Plan aus dem Status.
+  function scheduleLocked(naive, cat) {
+    if (planCovers(cat.plan, naive)) return planLockedAt(cat.plan, naive);
+    if (isHHMM(cat.lock) && isHHMM(cat.unlock)) return lockedBySchedule(naive, cat);
+    return false;
+  }
+
+  function scheduleNext(naive, cat) {
+    if (planCovers(cat.plan, naive)) return planNextChange(cat.plan, naive);
+    if (isHHMM(cat.lock) && isHHMM(cat.unlock)) return nextTransition(naive, cat);
+    return null;
+  }
+
   // Was soll jetzt gelten? {locked, source, override}
   function desired(cat, naive) {
     var o = activeOverride(cat, naive);
     if (o) return { locked: o.state === "locked", source: "override", override: o };
-    return { locked: lockedBySchedule(naive, cat), source: "schedule", override: null };
+    return { locked: scheduleLocked(naive, cat), source: "schedule", override: null };
   }
 
-  // Naechster Wechsel (beruecksichtigt Sonderregel)
+  // Naechster Wechsel (beruecksichtigt Sonderregel); null, wenn keiner absehbar ist
   function nextChange(cat, naive) {
     var o = activeOverride(cat, naive);
-    if (o) return { at: o.until, to: lockedBySchedule(o.until, cat) ? "locked" : "free", viaOverride: true };
-    var t = nextTransition(naive, cat);
-    return { at: t.at, to: t.to, viaOverride: false };
+    if (o) return { at: o.until, to: scheduleLocked(o.until, cat) ? "locked" : "free", viaOverride: true };
+    var t = scheduleNext(naive, cat);
+    return t ? { at: t.at, to: t.to, viaOverride: false } : null;
   }
 
   /* ---------- Texte ---------- */
@@ -178,24 +427,79 @@
     };
   }
 
+  // Naechste Freigabe laut Zeitplan: ist das Tier gerade (laut Plan) gesperrt, die naechste; sonst die nach der naechsten Sperre
+  function nextScheduledFree(cat, naive) {
+    return nextScheduled(cat, naive, "free");
+  }
+  // Naechste Sperre laut Zeitplan: ist das Tier gerade (laut Plan) frei, die naechste; sonst die nach der naechsten Freigabe
+  function nextScheduledLock(cat, naive) {
+    return nextScheduled(cat, naive, "locked");
+  }
+  function nextScheduled(cat, naive, target) {
+    if (planCovers(cat.plan, naive)) {
+      var seen = planLockedAt(cat.plan, naive) === (target === "free") ? true : false; // schon im "Gegenteil" von target?
+      var list = planBoundaries(cat.plan);
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].at <= naive) continue;
+        if (list[i].to === target && seen) return list[i].at;
+        if (list[i].to !== target) seen = true;
+      }
+      return null;
+    }
+    if (isHHMM(cat.lock) && isHHMM(cat.unlock)) return nextOccurrence(naive, target === "free" ? cat.unlock : cat.lock);
+    return null;
+  }
+
   /* Auswahl im Dialog "jetzt drinnen lassen" / "jetzt rauslassen" */
   function overrideOptions(cat, naive, wantLocked) {
     var out = [];
     function add(key, label, until, hint) {
-      if (out.some(function (o) { return o.until === until; })) return;
+      if (!until || out.some(function (o) { return o.until === until; })) return;
       out.push({ key: key, label: label, until: until, hint: hint || "" });
     }
     if (wantLocked) {
       add("2h", "2 Stunden", addMinutes(naive, 120));
-      var u = nextOccurrence(naive, cat.unlock);
-      add("unlock", "Bis " + whenLabel(naive, u), u, "dann gilt wieder der Zeitplan");
+      var u = nextScheduledFree(cat, naive);
+      if (u) add("unlock", "Bis " + whenLabel(naive, u), u, "dann gilt wieder der Zeitplan");
       add("hold", "Bis ich es aufhebe", addDays(naive, HOLD_DAYS), "höchstens " + HOLD_DAYS + " Tage");
     } else {
       add("1h", "1 Stunde", addMinutes(naive, 60));
       add("3h", "3 Stunden", addMinutes(naive, 180));
-      var l = nextOccurrence(naive, cat.lock);
-      add("lock", "Bis " + whenLabel(naive, l), l, "dann gilt wieder der Zeitplan");
+      var l = nextScheduledLock(cat, naive);
+      if (l) add("lock", "Bis " + whenLabel(naive, l), l, "dann gilt wieder der Zeitplan");
+      else add("hold", "Bis ich es aufhebe", addDays(naive, HOLD_DAYS), "höchstens " + HOLD_DAYS + " Tage");
     }
+    return out;
+  }
+
+  /* "Alle drinnen lassen" / "Alle rauslassen": gemeinsame Auswahl und die daraus folgenden Sonderregeln.
+   * key: 2h | 1h | 3h | plan (bis zur naechsten Freigabe / Sperre laut Zeitplan) | hold */
+  function bulkChoices(wantLocked) {
+    return wantLocked
+      ? [{ key: "2h", label: "2 Stunden", hint: "" },
+         { key: "plan", label: "Bis zur nächsten Freigabe", hint: "dann gilt wieder der Zeitplan" },
+         { key: "hold", label: "Bis ich es aufhebe", hint: "höchstens " + HOLD_DAYS + " Tage" }]
+      : [{ key: "1h", label: "1 Stunde", hint: "" },
+         { key: "3h", label: "3 Stunden", hint: "" },
+         { key: "plan", label: "Bis zur nächsten Sperre", hint: "dann gilt wieder der Zeitplan" }];
+  }
+  // -> {name: {state, until}} fuer alle Tiere, bei denen die Wahl etwas aendert
+  function bulkOverrides(cats, naive, wantLocked, key) {
+    var out = {};
+    (cats || []).forEach(function (cat) {
+      var want = desired(Object.assign({}, cat, { override: null }), naive).locked;
+      var until = null;
+      if (key === "2h") until = addMinutes(naive, 120);
+      else if (key === "1h") until = addMinutes(naive, 60);
+      else if (key === "3h") until = addMinutes(naive, 180);
+      else if (key === "hold") until = addDays(naive, HOLD_DAYS);
+      else if (key === "plan") {
+        // der Plan hat schon, was gewuenscht ist -> keine Sonderregel noetig
+        if (want === wantLocked) return;
+        until = wantLocked ? nextScheduledFree(cat, naive) : nextScheduledLock(cat, naive);
+      }
+      if (until) out[cat.name] = { state: wantLocked ? "locked" : "free", until: until };
+    });
     return out;
   }
 
@@ -252,7 +556,49 @@
 
   function emptySchedule() {
     return { enabled: true, timezone: DEFAULT_TZ, alert_window_minutes: 45, lead_minutes: DEFAULT_LEAD,
-      alerts: normalizeAlerts(null), cats: [] };
+      alerts: normalizeAlerts(null), location: null, vacations: [], cats: [] };
+  }
+
+  var MAX_RULES = 14;
+  var MAX_VACATIONS = 60;
+
+  function isDate(v) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v || "");
+    if (!m) return false;
+    var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3];
+  }
+
+  function normalizeLocation(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var lat = parseFloat(raw.lat), lon = parseFloat(raw.lon);
+    if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+    var out = { lat: Math.round(lat * 10000) / 10000, lon: Math.round(lon * 10000) / 10000 };
+    if (raw.label && typeof raw.label === "string") out.label = raw.label.slice(0, 40);
+    return out;
+  }
+
+  function normalizeVacations(raw) {
+    var out = [];
+    (Array.isArray(raw) ? raw : []).forEach(function (v, i) {
+      if (!v || typeof v !== "object") return;
+      out.push({
+        id: String(v.id || "v" + (i + 1)),
+        from: String(v.from || ""), to: String(v.to || ""),
+        state: v.state === "free" ? "free" : "locked",
+        cats: Array.isArray(v.cats) ? v.cats.map(function (c) { return String(c).trim(); }).filter(Boolean) : [],
+        note: String(v.note || "").slice(0, 80)
+      });
+    });
+    return out;
+  }
+
+  function newVacationId() { return "v" + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36); }
+
+  // Urlaub, der schon vorbei ist (Ende vor heute), weglassen
+  function pruneVacations(vacations, todayNaive) {
+    var today = todayNaive.slice(0, 10);
+    return (vacations || []).filter(function (v) { return !isDate(v.to) || v.to >= today; });
   }
 
   function normalizeSchedule(raw) {
@@ -264,14 +610,23 @@
     base.alert_window_minutes = isNaN(w) ? 45 : w;
     base.lead_minutes = clampInt(raw.lead_minutes, 0, 30, DEFAULT_LEAD);
     base.alerts = normalizeAlerts(raw.alerts);
+    base.location = normalizeLocation(raw.location);
+    base.vacations = normalizeVacations(raw.vacations);
     base.cats = (Array.isArray(raw.cats) ? raw.cats : []).map(function (c) {
-      return { name: String(c.name || ""), lock: String(c.lock || "22:00"), unlock: String(c.unlock || "06:30") };
+      var cat = { name: String(c.name || ""), lock: String(c.lock || "22:00"), unlock: String(c.unlock || "06:30") };
+      if (Array.isArray(c.rules)) cat.rules = catRules(c);
+      return cat;
     });
     return base;
   }
 
+  // "daily" = jeden Tag gleich, "weekly" = Regeln je Wochentag, "none" = kein fester Zeitplan
+  function catMode(c) { return !Array.isArray(c.rules) ? "daily" : c.rules.length ? "weekly" : "none"; }
+
+  function newRule() { return { days: [0, 1, 2, 3, 4, 5, 6], lock: "22:00", unlock: "06:30" }; }
+
   function validateSchedule(schedule) {
-    var errors = [], seen = {};
+    var errors = [], seen = {}, needsSun = false;
     if (!schedule.cats.length) errors.push("Bitte mindestens ein Tier eintragen.");
     schedule.cats.forEach(function (c, i) {
       var label = c.name.trim() || "Tier " + (i + 1);
@@ -279,24 +634,61 @@
       var key = c.name.trim().toLowerCase();
       if (key && seen[key]) errors.push("Der Name „" + c.name.trim() + "“ kommt doppelt vor.");
       seen[key] = true;
-      if (!isHHMM(c.lock)) errors.push(label + ": Die Sperrzeit fehlt.");
-      if (!isHHMM(c.unlock)) errors.push(label + ": Die Freigabezeit fehlt.");
-      if (isHHMM(c.lock) && c.lock === c.unlock) errors.push(label + ": Sperren und Freigeben dürfen nicht dieselbe Uhrzeit sein.");
+      if (!Array.isArray(c.rules)) {
+        if (!isWhen(c.lock)) errors.push(label + ": Die Sperrzeit fehlt.");
+        if (!isWhen(c.unlock)) errors.push(label + ": Die Freigabezeit fehlt.");
+        if (isWhen(c.lock) && canonWhen(c.lock) === canonWhen(c.unlock)) errors.push(label + ": Sperren und Freigeben dürfen nicht dieselbe Zeit sein.");
+        if (usesSun([{ lock: c.lock, unlock: c.unlock }])) needsSun = true;
+        return;
+      }
+      if (c.rules.length > MAX_RULES) errors.push(label + ": Höchstens " + MAX_RULES + " Zeiten.");
+      c.rules.forEach(function (r, j) {
+        var tag = label + ", Zeit " + (j + 1) + ": ";
+        if (!Array.isArray(r.days) || !r.days.length) errors.push(tag + "Bitte mindestens einen Wochentag wählen.");
+        if (!isWhen(r.lock)) errors.push(tag + "Die Sperrzeit fehlt.");
+        if (!isWhen(r.unlock)) errors.push(tag + "Die Freigabezeit fehlt.");
+        if (isWhen(r.lock) && canonWhen(r.lock) === canonWhen(r.unlock)) errors.push(tag + "Sperren und Freigeben dürfen nicht dieselbe Zeit sein.");
+        if (usesSun([r])) needsSun = true;
+      });
+    });
+    if (needsSun && !normalizeLocation(schedule.location)) errors.push("Für Sonnenauf- und -untergang bitte unten den Standort einstellen.");
+    if (schedule.location && !normalizeLocation(schedule.location)) errors.push("Der Standort ist ungültig (Breite −90 bis 90, Länge −180 bis 180).");
+    var vacs = schedule.vacations || [];
+    if (vacs.length > MAX_VACATIONS) errors.push("Höchstens " + MAX_VACATIONS + " Urlaubseinträge.");
+    vacs.forEach(function (v, i) {
+      var tag = "Urlaub " + (i + 1) + ": ";
+      if (!isDate(v.from) || !isDate(v.to)) errors.push(tag + "Bitte Beginn und Ende angeben.");
+      else if (v.to < v.from) errors.push(tag + "Das Ende liegt vor dem Beginn.");
     });
     return errors;
   }
 
+  function serializeCat(c) {
+    var name = c.name.trim();
+    if (!Array.isArray(c.rules)) return { name: name, lock: canonWhen(c.lock) || c.lock, unlock: canonWhen(c.unlock) || c.unlock };
+    return { name: name, rules: catRules(c) };
+  }
+
+  function serializeVacation(v) {
+    var out = { id: v.id, from: v.from, to: v.to, state: v.state === "free" ? "free" : "locked" };
+    if (v.cats && v.cats.length) out.cats = v.cats.slice();
+    if (v.note) out.note = v.note;
+    return out;
+  }
+
   function serializeSchedule(schedule) {
-    return JSON.stringify({
+    var out = {
       enabled: !!schedule.enabled,
       timezone: schedule.timezone || DEFAULT_TZ,
       alert_window_minutes: schedule.alert_window_minutes || 45,
       lead_minutes: schedule.lead_minutes == null ? DEFAULT_LEAD : schedule.lead_minutes,
-      alerts: normalizeAlerts(schedule.alerts),
-      cats: schedule.cats.map(function (c) {
-        return { name: c.name.trim(), lock: c.lock, unlock: c.unlock };
-      })
-    });
+      alerts: normalizeAlerts(schedule.alerts)
+    };
+    var loc = normalizeLocation(schedule.location);
+    if (loc) out.location = loc;
+    if (schedule.vacations && schedule.vacations.length) out.vacations = schedule.vacations.map(serializeVacation);
+    out.cats = schedule.cats.map(serializeCat);
+    return JSON.stringify(out);
   }
 
   function sameSchedule(a, b) { return serializeSchedule(a) === serializeSchedule(b); }
@@ -572,6 +964,16 @@
     activityLine: activityLine, eventText: eventText, annotateEvents: annotateEvents, dayHeading: dayHeading,
     batteryTone: batteryTone, signalLevel: signalLevel, signalLabel: signalLabel, warningText: warningText,
     warningTitle: warningTitle, durationShort: durationShort, alertChoices: alertChoices, sameAlerts: sameAlerts,
-    encodeSetup: encodeSetup, decodeSetup: decodeSetup, isLocalBase: isLocalBase
+    encodeSetup: encodeSetup, decodeSetup: decodeSetup, isLocalBase: isLocalBase,
+    parseWhen: parseWhen, whenText: whenText, canonWhen: canonWhen, isWhen: isWhen, whenKind: whenKind,
+    whenOffset: whenOffset, whenWith: whenWith, whenLabelText: whenLabelText,
+    sunTimes: sunTimes, weekdayOf: weekdayOf, DAY_NAMES: DAY_NAMES, DAY_ABBR: DAY_ABBR, MAX_RULES: MAX_RULES,
+    catRules: catRules, sameRules: sameRules, isSimpleRules: isSimpleRules, usesSun: usesSun,
+    vacationZones: vacationZones, buildPlan: buildPlan, planCovers: planCovers, planLockedAt: planLockedAt,
+    planBoundaries: planBoundaries, planNextChange: planNextChange, planSegments: planSegments, planCaption: planCaption,
+    scheduleLocked: scheduleLocked, scheduleNext: scheduleNext, nextScheduledFree: nextScheduledFree,
+    nextScheduledLock: nextScheduledLock, bulkChoices: bulkChoices, bulkOverrides: bulkOverrides,
+    normalizeLocation: normalizeLocation, normalizeVacations: normalizeVacations, newVacationId: newVacationId,
+    pruneVacations: pruneVacations, catMode: catMode, newRule: newRule, isDate: isDate
   };
 });

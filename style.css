@@ -407,3 +407,50 @@ p.muted.small { margin: 14px 2px 0; }
   .scrim, .sheet, .toast { animation: none; }
   .cat, .switch span, .switch span::after, .nav-pill { transition: none; }
 }
+
+/* ---- Wochenplan, Sonnenzeiten, Urlaub (Version 1.2) ---- */
+.seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 14px; padding: 4px; background: var(--bg); border-radius: 16px; border: 1px solid var(--line); }
+.vac-form .seg { grid-template-columns: repeat(2, 1fr); }
+.seg-btn {
+  min-height: 48px; padding: 4px 6px; border: 0; border-radius: 12px; background: transparent; color: var(--ink-2);
+  font-size: 15px; font-weight: 600; line-height: 1.15;
+}
+.seg-btn[aria-pressed="true"] { background: var(--primary); color: var(--primary-ink); }
+
+.when-row { display: grid; gap: 8px; padding: 14px 0 0; }
+.when-label { font-size: 17px; }
+.when-ctrl { display: flex; gap: 8px; align-items: center; }
+.when-ctrl .select-sm { flex: 1 1 0; width: auto; min-width: 0; font-size: 16px; }
+.when-ctrl .time-input { flex: 1 1 0; width: auto; min-width: 0; }
+.select-sm { min-height: 56px; }
+
+.rule { margin-top: 14px; padding: 4px 14px 14px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
+.rule-title { margin: 10px 0 6px; font-size: 14px; font-weight: 700; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; }
+.chips-days { flex-wrap: nowrap; gap: 4px; margin: 0; }
+.chip-day { flex: 1 1 0; min-width: 0; padding: 0; text-align: center; }
+.preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 2px 0 0; }
+.preset-row .btn-text { min-height: 40px; font-size: 14px; }
+.rule .stack { margin-top: 6px; }
+
+.wp { display: grid; gap: 2px; margin: 8px 0 4px; }
+.wp-row { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 8px; }
+.wp-row .bar { margin: 5px 0; }
+.wp-day { font-size: 13px; color: var(--ink-2); }
+.wp-row:first-child .wp-day { color: var(--ink); font-weight: 700; }
+
+.vac-list { list-style: none; margin: 12px 0 0; padding: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
+.vac { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; }
+.vac + .vac { border-top: 1px solid var(--line); }
+.vac > div { min-width: 0; }
+.vac strong { font-size: 17px; }
+.vac span, .vac small { display: block; color: var(--ink-2); font-size: 15px; overflow-wrap: anywhere; }
+.badge { display: inline-block !important; margin-left: 6px; padding: 1px 8px; border-radius: 999px; background: var(--info-bg); color: var(--info-ink) !important; font-size: 12px !important; font-weight: 700; vertical-align: 2px; }
+.vac-form { margin-top: 18px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.mini-title { font-size: 17px; font-weight: 700; margin: 12px 0 0; }
+.form-label { margin: 14px 0 8px; font-size: 15px; font-weight: 600; color: var(--ink-2); }
+.vac-form .chips { margin: 0; }
+.date-input { width: 190px; font-size: 20px; }
+.num-input { width: 150px; }
+.vac-form .err { margin-top: 10px; color: var(--bad-ink); background: var(--bad-bg); border-radius: 14px; padding: 10px 14px; }
+
+.sel-row .select.select-wide { width: min(240px, 66%); }

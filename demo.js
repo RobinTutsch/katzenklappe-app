@@ -22,7 +22,7 @@
     var tz = "Europe/Berlin";
     var schedule = {
       enabled: true, timezone: tz, alert_window_minutes: 45, lead_minutes: 0,
-      alerts: L.normalizeAlerts(null),
+      alerts: L.normalizeAlerts(null), location: null, vacations: [],
       cats: [
         { name: "Tom", lock: "22:00", unlock: "06:30" },
         { name: "Mimo", lock: "23:30", unlock: "05:30" }
@@ -85,8 +85,22 @@
       history = ev;
     })();
 
+    // Plan (gesperrte Zeitraeume) ab gestern fuer rund fuenf Wochen, wie ihn der Zeitplan-Dienst in den Stand schreibt
+    function planFor(c, naive) {
+      var first = L.addDays(naive.slice(0, 10) + "T00:00", -1).slice(0, 10);
+      var zones = L.vacationZones(schedule.vacations, c.name);
+      var p;
+      try {
+        p = L.buildPlan(L.catRules(c), zones, first, 37, L.normalizeLocation(schedule.location), tz);
+      } catch (e) {
+        p = L.buildPlan([], zones, first, 37, null, tz);
+      }
+      return { start: p.start, end: p.end, locked: p.locked };
+    }
+
     function catView(c, naive) {
       var live = Object.assign({}, c);
+      live.plan = planFor(c, naive);
       var o = overrides[Object.keys(overrides).filter(function (k) { return k.toLowerCase() === c.name.toLowerCase(); })[0]];
       live.override = o && o.until > naive ? o : null;
       return live;
@@ -129,11 +143,21 @@
       return out;
     }
 
+    function sunToday(naive) {
+      var loc = L.normalizeLocation(schedule.location);
+      if (!loc) return null;
+      var t = L.sunTimes(naive.slice(0, 10), loc.lat, loc.lon, tz);
+      return { date: naive.slice(0, 10), sunrise: t[0] ? L.timeOf(t[0]) : null, sunset: t[1] ? L.timeOf(t[1]) : null };
+    }
+
     function statusDoc() {
       var naive = now();
       return {
         version: 2, config_ok: true, timezone: tz, paused: !schedule.enabled, api_ok: true,
         problems: [], offline: [], lead_minutes: 0, alerts: clone(schedule.alerts),
+        location: schedule.location ? { lat: schedule.location.lat, lon: schedule.location.lon } : null,
+        sun: sunToday(naive),
+        vacations: L.pruneVacations(schedule.vacations, naive).map(function (v) { return clone(v); }),
         devices: [
           { id: 1, kind: "flap", name: "Haustür", online: true, battery_v: 5.7, battery_pct: battery, signal_db: -65, hub_signal_db: -55 },
           { id: 2, kind: "hub", name: "Wohnzimmer", online: true }
@@ -147,13 +171,15 @@
           var want = L.desired(live, naive);
           var chg = L.nextChange(live, naive);
           var p = places[c.name];
+          var simple = !Array.isArray(c.rules) && L.isHHMM(c.lock) && L.isHHMM(c.unlock);
           return {
             name: c.name, location: p ? p.where : "unknown", location_since: p ? iso(p.since) : null,
             locked: c.name in applied ? applied[c.name] : null, profile_since: profileSince[c.name] || null,
             should_lock: want.locked, source: want.source,
-            lock: c.lock, unlock: c.unlock,
+            lock: simple ? c.lock : null, unlock: simple ? c.unlock : null,
+            rules: L.catRules(c), plan: clone(live.plan),
             override: live.override ? clone(live.override) : null,
-            next_change: { at: chg.at, to: chg.to }
+            next_change: chg ? { at: chg.at, to: chg.to } : null
           };
         })
       };

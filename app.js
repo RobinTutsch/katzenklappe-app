@@ -7,7 +7,7 @@
   var CFG_KEY = "klappe.cfg.v1";
   var CACHE_KEY = "klappe.cache.v1";
   var HINT_KEY = "klappe.hint.install";
-  var VERSION = "1.1";
+  var VERSION = "1.2";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -21,6 +21,7 @@
     sheet: null,
     toast: null,
     draft: null, saved: null, scheduleLoaded: false, scheduleError: null,
+    vacForm: null, vacError: "", shortcut: null,
     diag: null, diagBusy: false,
     installEvt: null, setupError: "", setupBusy: false,
     online: navigator.onLine !== false
@@ -299,13 +300,30 @@
       btn + '<button class="note-btn" data-action="hint-dismiss">Nicht mehr zeigen</button>');
   }
 
-  function barHtml(lock, unlock, naive) {
-    var segs = L.barSegments(lock, unlock).map(function (s) {
+  function segHtml(list) {
+    return list.map(function (s) {
       return '<span class="bar-seg" style="left:' + s.from.toFixed(3) + "%;width:" + (s.to - s.from).toFixed(3) + '%"></span>';
     }).join("");
-    return '<div class="bar"><div class="bar-track">' + segs + "</div>" +
-      '<span class="bar-now" style="left:' + L.nowPercent(naive).toFixed(3) + '%"></span></div>' +
-      '<p class="bar-caption">Gesperrt von ' + esc(lock) + " bis " + esc(unlock) + " Uhr</p>";
+  }
+
+  // Tagesleiste: gesperrte Abschnitte (Liste in Prozent), Jetzt-Markierung (oder null), Text darunter
+  function barHtml(segs, nowPct, caption) {
+    return '<div class="bar"><div class="bar-track">' + segHtml(segs) + "</div>" +
+      (nowPct == null ? "" : '<span class="bar-now" style="left:' + nowPct.toFixed(3) + '%"></span>') + "</div>" +
+      (caption ? '<p class="bar-caption">' + esc(caption) + "</p>" : "");
+  }
+
+  // Leiste fuer ein Tier aus dem Status (Plan, sonst die alten Felder lock/unlock)
+  function catBarHtml(c, naive) {
+    var day = naive.slice(0, 10);
+    if (c.plan) {
+      return barHtml(L.planSegments(c.plan, day), L.nowPercent(naive),
+        L.planCaption(c.plan, day, c.lock && c.unlock ? [c.lock, c.unlock] : null));
+    }
+    if (c.lock && c.unlock) {
+      return barHtml(L.barSegments(c.lock, c.unlock), L.nowPercent(naive), "Gesperrt von " + c.lock + " bis " + c.unlock + " Uhr");
+    }
+    return "";
   }
 
   function pendingTexts(p) {
@@ -375,7 +393,7 @@
       (d.sub ? '<p class="cat-sub">' + esc(d.sub) + "</p>" : "") +
       (d.locationText ? '<p class="cat-where">' + esc(d.locationText) + "</p>" : "") +
       (activity ? '<p class="cat-activity">' + esc(activity) + "</p>" : "") +
-      barHtml(c.lock, c.unlock, naive) +
+      catBarHtml(c, naive) +
       (d.override ? '<p class="cat-override">' + esc(d.overrideLabel) + "</p>" : "");
     var queued = p ? "" : queuedLabel(c, naive);
     if (queued) html += '<p class="cat-override" data-queued="1">' + esc(queued) + "</p>";
@@ -388,6 +406,36 @@
         "</div>";
     }
     return html + "</section>";
+  }
+
+  function bulkHtml() {
+    var st = S.status;
+    if (!st || (st.cats || []).length < 2) return "";
+    var naive = clockNaive(), p = S.pending["__bulk"];
+    var any = (st.cats || []).some(function (c) { return c.override; }) || (S.overrides && Object.keys(L.pruneOverrides(S.overrides, naive)).length);
+    return '<section class="card" aria-label="Alle Tiere"><h2 class="card-title">Alle Tiere</h2>' +
+      '<p class="card-sub">Gilt für alle Tiere mit Zeitplan auf einmal.</p>' +
+      (p ? busyHtml("__bulk", p)
+        : '<div class="cat-actions"><button class="cat-btn" data-action="open-bulk" data-locked="1">Alle drinnen lassen</button>' +
+          '<button class="cat-btn" data-action="open-bulk" data-locked="0">Alle rauslassen</button>' +
+          (any ? '<button class="cat-link" data-action="clear-all-overrides">Für alle den Zeitplan wieder gelten lassen</button>' : "") + "</div>") +
+      "</section>";
+  }
+
+  // Hinweis auf laufenden oder bald beginnenden Urlaub
+  function vacationNoteHtml(naive) {
+    var st = S.status, today = naive.slice(0, 10), soon = L.addDays(today + "T00:00", 7).slice(0, 10);
+    var list = (st && st.vacations) || [];
+    var now = list.filter(function (v) { return v.from <= today && today <= v.to; });
+    var next = list.filter(function (v) { return v.from > today && v.from <= soon; });
+    if (!now.length && !next.length) return "";
+    var lines = now.map(function (v) {
+      return vacWho(v) + ": " + vacWhat(v) + " bis " + fmtDate(v.to, v.to.slice(0, 4) !== today.slice(0, 4)) + (v.note ? " (" + v.note + ")" : "") + ".";
+    }).concat(next.map(function (v) {
+      return "Ab " + fmtDate(v.from, false) + ": " + vacWho(v) + ", " + vacWhat(v) + (v.note ? " (" + v.note + ")" : "") + ".";
+    }));
+    return noteHtml("info", now.length ? "Gerade gilt eine Ausnahme vom Wochenplan" : "Bald gilt eine Ausnahme vom Wochenplan", lines,
+      '<button class="note-btn" data-action="goto-times">Zu den Zeiten</button>');
   }
 
   function othersHtml() {
@@ -447,9 +495,9 @@
   function viewHome() {
     var naive = clockNaive();
     var cats = (S.status && S.status.cats) || [];
-    var html = headerHtml() + bannersHtml();
+    var html = headerHtml() + bannersHtml() + vacationNoteHtml(naive);
     cats.forEach(function (c) { html += catCardHtml(c, naive); });
-    html += othersHtml() + devicesHtml();
+    html += bulkHtml() + othersHtml() + devicesHtml();
     var ago = lastCheckLabel();
     html += '<div class="meta"><span>' +
       (S.loading ? "Wird aktualisiert …" : (ago ? "Zuletzt geprüft " + esc(ago) : "")) +
@@ -576,18 +624,205 @@
       (dirty ? "Änderungen speichern" : "Keine Änderungen") + "</button>";
   }
 
+  var CITIES = [["Berlin", 52.52, 13.405], ["Hamburg", 53.55, 9.99], ["München", 48.14, 11.58], ["Köln", 50.94, 6.96],
+    ["Frankfurt am Main", 50.11, 8.68], ["Stuttgart", 48.78, 9.18], ["Düsseldorf", 51.23, 6.78], ["Leipzig", 51.34, 12.37],
+    ["Dresden", 51.05, 13.74], ["Hannover", 52.37, 9.73], ["Nürnberg", 49.45, 11.08], ["Bremen", 53.08, 8.8],
+    ["Wien", 48.21, 16.37], ["Zürich", 47.38, 8.54]];
+  var OFFSETS = [-120, -90, -60, -45, -30, -15, 0, 15, 30, 45, 60, 90, 120];
+
+  function draftTz() { return (S.draft && S.draft.timezone) || (S.status && S.status.timezone) || L.DEFAULT_TZ; }
+
+  function offsetLabel(n) {
+    return n === 0 ? "genau" : Math.abs(n) + " Min. " + (n < 0 ? "vorher" : "nachher");
+  }
+
+  // Auswahl "Uhrzeit | Sonnenuntergang | Sonnenaufgang" plus Uhrzeit bzw. Versatz
+  function whenEditHtml(base, label, value, attrs) {
+    var kind = L.whenKind(value);
+    var kinds = [["clock", "Uhrzeit"], ["sunset", "Sonnenuntergang"], ["sunrise", "Sonnenaufgang"]];
+    var html = '<div class="when-row"><label class="when-label" for="' + base + '">' + esc(label) + '</label><div class="when-ctrl">' +
+      '<select class="select select-sm" id="' + base + '-k" aria-label="Art: ' + esc(label) + '" data-when="kind" ' + attrs + ">" +
+      kinds.map(function (k) { return '<option value="' + k[0] + '"' + (k[0] === kind ? " selected" : "") + ">" + k[1] + "</option>"; }).join("") + "</select>";
+    if (kind === "clock") {
+      html += '<input class="time-input" type="time" id="' + base + '" ' + attrs + ' value="' + esc(L.isHHMM(value) ? value : "") + '">';
+    } else {
+      var off = L.whenOffset(value), list = OFFSETS.indexOf(off) >= 0 ? OFFSETS : OFFSETS.concat([off]).sort(function (x, y) { return x - y; });
+      html += '<select class="select select-sm" id="' + base + '" aria-label="Versatz: ' + esc(label) + '" data-when="offset" ' + attrs + ">" +
+        list.map(function (n) { return '<option value="' + n + '"' + (n === off ? " selected" : "") + ">" + offsetLabel(n) + "</option>"; }).join("") + "</select>";
+    }
+    return html + "</div></div>";
+  }
+
+  function modeSwitchHtml(c, i) {
+    var mode = L.catMode(c);
+    return '<div class="seg" role="group" aria-label="Art des Zeitplans">' + [
+      ["daily", "Jeden Tag gleich"], ["weekly", "Je Wochentag"], ["none", "Kein fester Zeitplan"]
+    ].map(function (m) {
+      return '<button class="seg-btn" data-action="cat-mode" data-idx="' + i + '" data-mode="' + m[0] + '" aria-pressed="' + (mode === m[0]) + '">' + m[1] + "</button>";
+    }).join("") + "</div>";
+  }
+
+  function ruleHtml(c, i, r, j) {
+    var attrs = 'data-idx="' + i + '" data-rule="' + j + '"';
+    var days = L.DAY_ABBR.map(function (d, k) {
+      return '<button class="chip chip-day" data-action="toggle-day" data-idx="' + i + '" data-rule="' + j + '" data-day="' + k +
+        '" aria-pressed="' + (r.days.indexOf(k) >= 0) + '" aria-label="' + L.DAY_NAMES[k] + '">' + d + "</button>";
+    }).join("");
+    return '<div class="rule"><p class="rule-title">Zeit ' + (j + 1) + "</p>" +
+      '<div class="chips chips-days" role="group" aria-label="Wochentage, Zeit ' + (j + 1) + '">' + days + "</div>" +
+      '<div class="preset-row">' + [["all", "Alle Tage"], ["week", "Mo–Fr"], ["weekend", "Sa + So"]].map(function (pr) {
+        return '<button class="btn-text" data-action="days-preset" data-idx="' + i + '" data-rule="' + j + '" data-preset="' + pr[0] + '">' + pr[1] + "</button>";
+      }).join("") + "</div>" +
+      whenEditHtml("l" + i + "-" + j, "Ausgang sperren ab", r.lock, attrs + ' data-field="lock"') +
+      whenEditHtml("u" + i + "-" + j, "Wieder freigeben um", r.unlock, attrs + ' data-field="unlock"') +
+      (c.rules.length > 1 ? '<div class="stack"><button class="btn-text btn-text-danger" data-action="remove-rule" data-idx="' + i + '" data-rule="' + j + '">Diese Zeit entfernen</button></div>' : "") +
+      "</div>";
+  }
+
+  // Plan der Vorschau aus dem Entwurf (ohne Urlaub); null, solange etwas ungueltig ist
+  function previewPlan(c, days) {
+    var mode = L.catMode(c);
+    var rules = L.catRules(c);
+    if (mode === "none") return L.buildPlan([], [], clockNaive().slice(0, 10), days || 7, null, draftTz());
+    var ok = rules.length && rules.every(function (r) {
+      return L.isWhen(r.lock) && L.isWhen(r.unlock) && L.canonWhen(r.lock) !== L.canonWhen(r.unlock) && r.days.length;
+    });
+    var loc = L.normalizeLocation(S.draft.location);
+    if (!ok || (L.usesSun(rules) && !loc)) return null;
+    try {
+      return L.buildPlan(rules, [], clockNaive().slice(0, 10), days || 7, loc, draftTz());
+    } catch (e) { return null; }
+  }
+
+  function previewHtml(c, naive) {
+    var mode = L.catMode(c);
+    if (mode === "none") {
+      return '<p class="muted small">Die Klappe ist nach Zeitplan immer frei. Sonderregeln, Urlaub und „Alle drinnen lassen“ gelten trotzdem.</p>';
+    }
+    var plan = previewPlan(c, 7);
+    if (!plan) return '<p class="muted small">Die Vorschau erscheint, sobald alle Zeiten gültig sind' +
+      (L.usesSun(L.catRules(c)) && !L.normalizeLocation(S.draft.location) ? " und der Standort eingestellt ist" : "") + ".</p>";
+    var today = naive.slice(0, 10);
+    if (mode === "daily") {
+      var simple = L.isHHMM(c.lock) && L.isHHMM(c.unlock) ? [c.lock, c.unlock] : null;
+      return barHtml(L.planSegments(plan, today), L.nowPercent(naive), L.planCaption(plan, today, simple));
+    }
+    var rows = "";
+    for (var d = 0; d < 7; d++) {
+      var day = L.addDays(today + "T00:00", d).slice(0, 10);
+      rows += '<div class="wp-row"><span class="wp-day">' + (d === 0 ? "Heute" : L.DAY_ABBR[L.weekdayOf(day)]) + "</span>" +
+        barHtml(L.planSegments(plan, day), d === 0 ? L.nowPercent(naive) : null, "") + "</div>";
+    }
+    return '<div class="wp" role="img" aria-label="Wochenübersicht der Sperrzeiten">' + rows + "</div>" +
+      '<p class="bar-caption">' + esc(L.planCaption(plan, today)) + "</p>";
+  }
+
   function catEditHtml(c, i, naive) {
+    var mode = L.catMode(c), body = "";
+    if (mode === "daily") {
+      var attrs = 'data-idx="' + i + '"';
+      body = whenEditHtml("l" + i, "Ausgang sperren ab", c.lock, attrs + ' data-field="lock"') +
+        whenEditHtml("u" + i, "Wieder freigeben um", c.unlock, attrs + ' data-field="unlock"');
+    } else if (mode === "weekly") {
+      body = c.rules.map(function (r, j) { return ruleHtml(c, i, r, j); }).join("") +
+        (c.rules.length < L.MAX_RULES ? '<div class="stack"><button class="btn btn-quiet" data-action="add-rule" data-idx="' + i + '">Weitere Zeit hinzufügen</button></div>' : "");
+    }
     return '<section class="cat-edit">' +
       '<label class="sr" for="n' + i + '">Name des Tiers</label>' +
       '<input class="name-input" id="n' + i + '" data-field="name" data-idx="' + i + '" value="' + esc(c.name) + '" placeholder="Name" autocomplete="off" autocapitalize="words" spellcheck="false">' +
       '<p style="color:var(--ink-2);font-size:14px;margin-top:6px">Genau so geschrieben wie in der Sure-App.</p>' +
-      '<div class="time-row"><label for="l' + i + '">Ausgang sperren ab</label>' +
-      '<input class="time-input" type="time" id="l' + i + '" data-field="lock" data-idx="' + i + '" value="' + esc(c.lock) + '"></div>' +
-      '<div class="time-row"><label for="u' + i + '">Wieder freigeben um</label>' +
-      '<input class="time-input" type="time" id="u' + i + '" data-field="unlock" data-idx="' + i + '" value="' + esc(c.unlock) + '"></div>' +
-      '<div class="preview" data-bar="' + i + '">' + barHtml(c.lock, c.unlock, naive) + "</div>" +
+      modeSwitchHtml(c, i) + body +
+      '<div class="preview" data-preview="' + i + '">' + previewHtml(c, naive) + "</div>" +
       '<div class="stack"><button class="btn-text btn-text-danger" data-action="remove-cat" data-idx="' + i + '">Tier entfernen</button></div>' +
       "</section>";
+  }
+
+  /* ----- Standort ----- */
+
+  function locationKey(loc) {
+    if (!loc) return "none";
+    for (var i = 0; i < CITIES.length; i++) {
+      if (loc.label === CITIES[i][0] && Math.abs(loc.lat - CITIES[i][1]) < 0.0005 && Math.abs(loc.lon - CITIES[i][2]) < 0.0005) return "c" + i;
+    }
+    return loc.label === "Mein Standort" ? "gps" : "custom";
+  }
+
+  function sunLineHtml() {
+    var loc = L.normalizeLocation(S.draft.location);
+    if (!loc) return "";
+    var t = L.sunTimes(clockNaive().slice(0, 10), loc.lat, loc.lon, draftTz());
+    if (!t[0] || !t[1]) return '<p class="muted small">An diesem Ort geht die Sonne heute nicht auf oder unter.</p>';
+    return '<p class="muted small" id="sun-line">Heute: Sonnenaufgang ' + esc(L.timeOf(t[0])) + " Uhr, Sonnenuntergang " + esc(L.timeOf(t[1])) + " Uhr.</p>";
+  }
+
+  function locationEditHtml() {
+    var loc = S.draft.location, key = locationKey(loc);
+    var used = S.draft.cats.some(function (c) { return L.usesSun(L.catRules(c)); });
+    var opts = [["none", "Kein Standort"]].concat(CITIES.map(function (c, i) { return ["c" + i, c[0]]; }))
+      .concat([["gps", "Mein Standort (GPS)"], ["custom", "Eigene Koordinaten"]]);
+    var html = '<section class="section"><h2>Standort</h2>' +
+      "<p>Nur nötig, wenn eine Zeit „Sonnenuntergang“ oder „Sonnenaufgang“ heißt." + (used ? "" : " Im Moment nutzt kein Tier das.") + "</p>" +
+      '<div class="sel-row"><label for="loc-city">Ort</label><select class="select select-wide" id="loc-city" data-loc="city">' +
+      opts.map(function (o) { return '<option value="' + o[0] + '"' + (o[0] === key ? " selected" : "") + ">" + esc(o[1]) + "</option>"; }).join("") + "</select></div>";
+    if (key === "custom") {
+      html += '<div class="time-row"><label for="loc-lat">Breite (Nord)</label><input class="time-input num-input" type="number" step="0.0001" min="-90" max="90" inputmode="decimal" id="loc-lat" data-locfield="lat" value="' + esc(loc.lat) + '"></div>' +
+        '<div class="time-row"><label for="loc-lon">Länge (Ost)</label><input class="time-input num-input" type="number" step="0.0001" min="-180" max="180" inputmode="decimal" id="loc-lon" data-locfield="lon" value="' + esc(loc.lon) + '"></div>';
+    } else if (key === "gps") {
+      html += '<p class="muted small">Auf etwa einen Kilometer gerundet: ' + esc(String(loc.lat).replace(".", ",") + " / " + String(loc.lon).replace(".", ",")) + ".</p>";
+    }
+    html += '<div class="stack"><button class="btn btn-quiet" data-action="geolocate">Meinen Standort verwenden</button></div>' +
+      '<div id="sun-wrap">' + sunLineHtml() + "</div></section>";
+    return html;
+  }
+
+  /* ----- Urlaub und Ausnahmen ----- */
+
+  function fmtDate(iso, withYear) {
+    var p = iso.split("-");
+    return p[2] + "." + p[1] + "." + (withYear ? p[0] : "");
+  }
+  function vacRange(v, today) {
+    var y = today.slice(0, 4), many = v.from.slice(0, 4) !== y || v.to.slice(0, 4) !== y;
+    return v.from === v.to ? fmtDate(v.from, many) : fmtDate(v.from, many) + " – " + fmtDate(v.to, many);
+  }
+  function vacWho(v) { return v.cats && v.cats.length ? v.cats.join(", ") : "Alle Tiere"; }
+  function vacWhat(v) { return v.state === "free" ? "draußen erlaubt" : "drinnen bleiben"; }
+
+  function newVacForm() {
+    return { from: "", to: "", state: "locked", cats: [], note: "" };
+  }
+
+  function vacationEditHtml() {
+    var today = clockNaive().slice(0, 10);
+    var list = (S.draft.vacations || []).slice().sort(function (a, b) { return a.from < b.from ? -1 : a.from > b.from ? 1 : 0; });
+    var f = S.vacForm || (S.vacForm = newVacForm());
+    var html = '<section class="section"><h2>Urlaub und Ausnahmen</h2>' +
+      "<p>Für ganze Tage: Die Tiere bleiben drinnen oder dürfen den ganzen Tag raus, egal was der Wochenplan sagt.</p>";
+    if (list.length) {
+      html += '<ul class="vac-list">' + list.map(function (v) {
+        var idx = S.draft.vacations.indexOf(v), active = v.from <= today && today <= v.to;
+        return '<li class="vac"><div><strong>' + esc(vacRange(v, today)) + "</strong>" + (active ? ' <span class="badge">läuft</span>' : "") +
+          "<span>" + esc(vacWho(v) + ": " + vacWhat(v)) + "</span>" + (v.note ? "<small>" + esc(v.note) + "</small>" : "") + "</div>" +
+          '<button class="btn-text btn-text-danger" data-action="remove-vac" data-idx="' + idx + '" aria-label="Eintrag ' + esc(vacRange(v, today)) + ' entfernen">Entfernen</button></li>';
+      }).join("") + "</ul>";
+    } else {
+      html += '<p class="muted small">Noch nichts eingetragen.</p>';
+    }
+    html += '<div class="vac-form"><h3 class="mini-title">Neu eintragen</h3>' +
+      '<div class="time-row"><label for="vac-from">Von</label><input class="time-input date-input" type="date" id="vac-from" data-vac="from" min="' + today + '" value="' + esc(f.from) + '"></div>' +
+      '<div class="time-row"><label for="vac-to">Bis (einschließlich)</label><input class="time-input date-input" type="date" id="vac-to" data-vac="to" min="' + esc(f.from || today) + '" value="' + esc(f.to) + '"></div>' +
+      '<p class="form-label" id="vac-who-l">Für wen</p><div class="chips" role="group" aria-labelledby="vac-who-l">' +
+      '<button class="chip" data-action="vac-cat" data-name="" aria-pressed="' + (f.cats.length === 0) + '">Alle</button>' +
+      S.draft.cats.filter(function (c) { return c.name.trim(); }).map(function (c) {
+        return '<button class="chip" data-action="vac-cat" data-name="' + esc(c.name.trim()) + '" aria-pressed="' + (f.cats.indexOf(c.name.trim()) >= 0) + '">' + esc(c.name.trim()) + "</button>";
+      }).join("") + "</div>" +
+      '<p class="form-label" id="vac-what-l">Was gilt</p><div class="seg" role="group" aria-labelledby="vac-what-l">' +
+      '<button class="seg-btn" data-action="vac-state" data-state="locked" aria-pressed="' + (f.state === "locked") + '">Drinnen bleiben</button>' +
+      '<button class="seg-btn" data-action="vac-state" data-state="free" aria-pressed="' + (f.state === "free") + '">Draußen erlaubt</button></div>' +
+      '<div class="field"><label for="vac-note">Notiz (freiwillig)</label><input class="input" id="vac-note" data-vac="note" maxlength="80" value="' + esc(f.note) + '" placeholder="z. B. Besuch, Tierarzt" autocomplete="off"></div>' +
+      '<div class="stack"><button class="btn btn-quiet" data-action="add-vac">Eintragen</button></div>' +
+      (S.vacError ? '<p class="err" role="alert">' + esc(S.vacError) + "</p>" : "") + "</div></section>";
+    return html;
   }
 
   function alertSelectHtml(key, label) {
@@ -620,11 +855,17 @@
         raw = {
           enabled: !S.status.paused, timezone: S.status.timezone,
           lead_minutes: S.status.lead_minutes, alerts: S.status.alerts,
-          cats: (S.status.cats || []).map(function (c) { return { name: c.name, lock: c.lock, unlock: c.unlock }; })
+          location: S.status.location || null, vacations: S.status.vacations || [],
+          cats: (S.status.cats || []).map(function (c) {
+            return c.lock && c.unlock ? { name: c.name, lock: c.lock, unlock: c.unlock }
+              : { name: c.name, rules: c.rules || [] };
+          })
         };
       }
       S.saved = L.normalizeSchedule(raw);
+      S.saved.vacations = L.pruneVacations(S.saved.vacations, clockNaive());
       S.draft = clone(S.saved);
+      S.vacForm = null; S.vacError = "";
       S.scheduleLoaded = true; S.scheduleError = null;
     } catch (e) {
       S.scheduleError = e;
@@ -646,6 +887,8 @@
     html += '<div id="times-status">' + timesStatusHtml() + "</div>";
     S.draft.cats.forEach(function (c, i) { html += catEditHtml(c, i, naive); });
     html += '<div class="stack"><button class="btn btn-quiet btn-wide" data-action="add-cat">Tier hinzufügen</button></div>';
+    html += vacationEditHtml();
+    html += locationEditHtml();
     html += alertsEditHtml();
     html += '<div class="switch-row" style="margin-top:20px"><div><strong>Zeitplan aktiv</strong><p>Ausgeschaltet bleibt die Klappe, wie sie ist (z. B. beim Tierarzt).</p></div>' +
       '<label class="switch"><span class="sr">Zeitplan aktiv</span><input type="checkbox" data-field="enabled"' + (S.draft.enabled ? " checked" : "") + "><span></span></label></div>";
@@ -694,6 +937,9 @@
       '<details class="help"><summary>Warum dauert es etwa eine Minute?</summary><p>Die App gibt den Auftrag an einen kleinen Dienst weiter, der ihn über die Sure-Cloud an den Hub schickt. Das braucht ein bis zwei Minuten. Die App darf in der Zeit geschlossen werden.</p></details>' +
       '<details class="help"><summary>Was, wenn ich in der Sure-App etwas ändere?</summary><p>Beim nächsten Lauf (alle 30 Minuten) stellt der Zeitplan die Klappe wieder so, wie es hier eingestellt ist. Für Ausnahmen die Sonderregeln hier benutzen. Die Zeitschaltuhr in der Sure-App am besten ausgeschaltet lassen.</p></details>' +
       '<details class="help"><summary>Warum schaltet die Klappe manchmal ein paar Minuten früher?</summary><p>GitHub startet den Zeitplan nicht immer pünktlich, manchmal erst nach vielen Minuten. Damit trotzdem rechtzeitig gesperrt oder freigegeben wird, gilt der Zeitplan bis zu 8 Minuten früher als eingestellt.</p></details>' +
+      '<details class="help"><summary>Wie funktionieren Wochentage und Sonnenuntergang?</summary><p>Unter „Zeiten“ kannst du pro Tier „Je Wochentag“ wählen und mehrere Zeiten eintragen, zum Beispiel unter der Woche früher sperren als am Wochenende. Statt einer Uhrzeit geht auch „Sonnenuntergang“ oder „Sonnenaufgang“, auf Wunsch einige Minuten davor oder danach. Dafür braucht die App einen Standort.</p></details>' +
+      '<details class="help"><summary>Was ist „Urlaub und Ausnahmen“?</summary><p>Für ganze Tage kannst du festlegen, dass ein Tier drinnen bleibt oder den ganzen Tag raus darf. Das ersetzt dann den Wochenplan. Danach gilt er von selbst wieder.</p></details>' +
+      '<details class="help"><summary>Was macht „Alle drinnen lassen“?</summary><p>Es setzt für jedes Tier mit Zeitplan eine Sonderregel. Tiere, die keinen festen Zeitplan haben, kannst du unter „Zeiten“ mit „Kein fester Zeitplan“ aufnehmen. Dann wirkt „Alle drinnen lassen“ auch bei ihnen, sonst bleiben sie immer frei.</p></details>' +
       '<details class="help"><summary>Was bedeuten die Warnungen?</summary><p>Die App meldet sich, wenn ein Tier trotz Sperre noch draußen ist, sehr lange draußen bleibt, die Batterie der Klappe schwächer wird oder die Klappe oder der Hub offline ist. Auf dem Handy kommt die Meldung per ntfy, in der App steht sie oben in der Übersicht. Wann gewarnt wird, stellst du unter „Zeiten“ ein.</p></details>' +
       '<details class="help"><summary>Wie genau ist die Batterieanzeige?</summary><p>Die Klappe meldet nur ihre Spannung. Daraus wird der Prozentwert geschätzt, so wie es auch andere Programme für die Klappe machen. Er ist eine Orientierung, kein Messgerät. Bei etwa 25 Prozent solltest du neue Batterien bereitlegen.</p></details>' +
       '<details class="help"><summary>Woher kommt der Verlauf?</summary><p>Die Sure-Cloud merkt sich jeden Durchgang an der Klappe. Der Zeitplan holt diese Einträge bei jedem Lauf ab und speichert sie drei Wochen lang. In Echtzeit ist das nicht: Ein Eintrag erscheint erst beim nächsten Lauf.</p></details>' +
@@ -734,6 +980,21 @@
     if (sh.kind === "confirm") {
       inner = "<h2>" + esc(sh.title) + "</h2><p class=\"sheet-sub\">" + esc(sh.text) + "</p>" +
         '<button class="opt" data-action="confirm-yes"><strong>' + esc(sh.confirmLabel) + "</strong></button>";
+    } else if (sh.kind === "pickpet") {
+      inner = "<h2>Welches Tier?</h2><p class=\"sheet-sub\">Diese Tiere kennt die Sure-Cloud, sie haben hier noch keinen Eintrag.</p>" +
+        sh.names.map(function (n, i) {
+          return '<button class="opt" data-action="choose-pet" data-idx="' + i + '"><strong>' + esc(n) + "</strong></button>";
+        }).join("") +
+        '<button class="opt" data-action="choose-pet" data-idx="-1"><strong>Anderer Name …</strong><small>Zum Eintippen</small></button>';
+    } else if (sh.kind === "bulk") {
+      inner = "<h2>" + (sh.wantLocked ? "Alle drinnen lassen" : "Alle rauslassen") + "</h2>" +
+        '<p class="sheet-sub">' + esc(sh.wantLocked
+          ? "Bei allen Tieren bleibt der Ausgang gesperrt. Hinein kommen sie weiterhin. Für wie lange?"
+          : "Die Klappe lässt alle Tiere raus und rein. Für wie lange?") + "</p>" +
+        sh.options.map(function (o, i) {
+          return '<button class="opt" data-action="choose-bulk" data-idx="' + i + '"><strong>' + esc(o.label) + "</strong>" +
+            (o.hint ? "<small>" + esc(o.hint) + "</small>" : "") + "</button>";
+        }).join("");
     } else {
       inner = "<h2>" + esc(sh.name + (sh.wantLocked ? " drinnen lassen" : " rauslassen")) + "</h2>" +
         '<p class="sheet-sub">' + esc(sh.wantLocked
@@ -786,9 +1047,11 @@
     if (st) st.innerHTML = timesStatusHtml();
     var naive = clockNaive();
     S.draft.cats.forEach(function (c, i) {
-      var el = $app.querySelector('[data-bar="' + i + '"]');
-      if (el) el.innerHTML = barHtml(c.lock, c.unlock, naive);
+      var el = $app.querySelector('[data-preview="' + i + '"]');
+      if (el) el.innerHTML = previewHtml(c, naive);
     });
+    var sun = document.getElementById("sun-wrap");
+    if (sun) sun.innerHTML = sunLineHtml();
   }
 
   var toastTimer = null;
@@ -885,6 +1148,50 @@
     await runAndWait(name, token, clearDone(name), catSummary(name));
   }
 
+  function bulkDone(map, wantLocked) {
+    return function (st) {
+      return Object.keys(map).every(function (name) {
+        var c = catByName(st, name);
+        return !!(c && c.override && c.override.state === map[name].state && c.override.until === map[name].until && c.locked === wantLocked);
+      });
+    };
+  }
+
+  async function changeBulk(wantLocked, key) {
+    var naive = clockNaive();
+    var map = L.bulkOverrides((S.status && S.status.cats) || [], naive, wantLocked, key);
+    if (!Object.keys(map).length) {
+      toast(wantLocked ? "Alle sind ohnehin schon drinnen gesperrt." : "Alle dürfen ohnehin schon raus.");
+      return;
+    }
+    var token = { phase: "saving", error: null };
+    S.pending["__bulk"] = token; render();
+    try {
+      var cur = await S.api.getOverrides(), next = L.pruneOverrides(cur, naive);
+      Object.keys(map).forEach(function (name) { next = L.setOverride(next, name, map[name].state, map[name].until, naive); });
+      await S.api.setOverrides(next);
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait("__bulk", token, bulkDone(map, wantLocked),
+      wantLocked ? "Alle bleiben drinnen" : "Alle dürfen raus");
+  }
+
+  async function clearAllOverrides() {
+    var token = { phase: "saving", error: null };
+    S.pending["__bulk"] = token; render();
+    try {
+      await S.api.setOverrides({});
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait("__bulk", token, function (st) {
+      return (st.cats || []).every(function (c) { return !c.override && c.locked === c.should_lock; });
+    }, "Der Zeitplan gilt wieder für alle");
+  }
+
   function scheduleDone(draft) {
     return function (st) {
       if (!st || st.config_ok === false) return false;
@@ -892,10 +1199,23 @@
       if (st.alerts && !L.sameAlerts(st.alerts, draft.alerts)) return false;
       var cats = st.cats || [];
       if (cats.length !== draft.cats.length) return false;
-      return draft.cats.every(function (d) {
+      var catsOk = draft.cats.every(function (d) {
         var c = catByName(st, d.name.trim());
-        return !!c && c.lock === d.lock && c.unlock === d.unlock;
+        if (!c) return false;
+        if (c.rules) return L.sameRules(c.rules, L.catRules(d));   // Dienst mit Wochenplan: Regeln vergleichen
+        return !Array.isArray(d.rules) && c.lock === d.lock && c.unlock === d.unlock;
       });
+      if (!catsOk) return false;
+      if (st.vacations !== undefined) {
+        var key = function (v) { return JSON.stringify([v.id, v.from, v.to, v.state, (v.cats || []).join("|"), v.note || ""]); };
+        var want = L.pruneVacations(L.normalizeVacations(draft.vacations), clockNaive()).map(key).sort();
+        if (JSON.stringify(want) !== JSON.stringify((st.vacations || []).map(key).sort())) return false;
+      }
+      if (st.location !== undefined) {
+        var loc = L.normalizeLocation(draft.location);
+        if (JSON.stringify(st.location || null) !== JSON.stringify(loc ? { lat: loc.lat, lon: loc.lon } : null)) return false;
+      }
+      return true;
     };
   }
 
@@ -969,12 +1289,86 @@
     S.diagBusy = false; render();
   }
 
-  function addCat() {
-    S.draft.cats.push({ name: "", lock: "22:00", unlock: "06:30" });
+  function addCatNamed(name) {
+    S.draft.cats.push({ name: name, lock: "22:00", unlock: "06:30" });
     render(true);
     var inputs = $app.querySelectorAll(".name-input");
     var last = inputs[inputs.length - 1];
-    if (last) { last.focus(); last.scrollIntoView({ block: "center" }); }
+    if (last) { last.scrollIntoView({ block: "center" }); if (!name) last.focus(); }
+  }
+
+  // Tiere aus der Sure-Cloud anbieten, die noch keinen Eintrag haben
+  function addCat() {
+    var have = S.draft.cats.map(function (c) { return c.name.trim().toLowerCase(); });
+    var names = ((S.status && S.status.pets) || []).map(function (p) { return p.name; })
+      .filter(function (n) { return have.indexOf(n.trim().toLowerCase()) < 0; });
+    if (!names.length) { addCatNamed(""); return; }
+    S.sheet = { kind: "pickpet", names: names };
+    render();
+  }
+
+  function setCatMode(i, mode) {
+    var c = S.draft.cats[i], cur = L.catMode(c);
+    if (mode === cur) return;
+    if (cur === "weekly") c._stash = c.rules;
+    if (mode === "daily") {
+      if (cur === "weekly" && c.rules.length) { c.lock = c.rules[0].lock; c.unlock = c.rules[0].unlock; }
+      delete c.rules;
+    } else if (mode === "weekly") {
+      c.rules = c._stash && c._stash.length ? c._stash : [{ days: [0, 1, 2, 3, 4, 5, 6], lock: c.lock, unlock: c.unlock }];
+    } else {
+      c.rules = [];
+    }
+    render(true);
+  }
+
+  function toggleDay(i, j, day) {
+    var r = S.draft.cats[i].rules[j], at = r.days.indexOf(day);
+    if (at >= 0) r.days.splice(at, 1); else { r.days.push(day); r.days.sort(function (a, b) { return a - b; }); }
+    render(true);
+  }
+  function daysPreset(i, j, preset) {
+    S.draft.cats[i].rules[j].days = preset === "week" ? [0, 1, 2, 3, 4] : preset === "weekend" ? [5, 6] : [0, 1, 2, 3, 4, 5, 6];
+    render(true);
+  }
+
+  // Zeit-Auswahl (Art / Versatz) geaendert
+  function changeWhen(t) {
+    var cat = S.draft.cats[+t.dataset.idx], target = t.dataset.rule != null ? cat.rules[+t.dataset.rule] : cat;
+    var f = t.dataset.field, cur = target[f];
+    if (t.dataset.when === "kind") {
+      target[f] = t.value === "clock" ? (L.whenKind(cur) === "clock" ? cur : (f === "lock" ? "22:00" : "06:30")) : L.whenWith(t.value, 0);
+      if (t.value !== "clock" && !S.draft.location) S.draft.location = { lat: 52.52, lon: 13.405, label: "Berlin" };
+    } else {
+      target[f] = L.whenWith(L.whenKind(cur), parseInt(t.value, 10) || 0);
+    }
+    var id = t.id;
+    render(true);
+    var again = id && document.getElementById(id);
+    if (again) again.focus();
+  }
+
+  function addVacation() {
+    var f = S.vacForm || newVacForm();
+    var v = { id: L.newVacationId(), from: f.from, to: f.to || f.from, state: f.state, cats: f.cats.slice(), note: (f.note || "").trim() };
+    if (!L.isDate(v.from)) { S.vacError = "Bitte den ersten Tag wählen."; render(true); return; }
+    if (!L.isDate(v.to) || v.to < v.from) { S.vacError = "Das Ende darf nicht vor dem Beginn liegen."; render(true); return; }
+    S.vacError = "";
+    S.draft.vacations.push(v);
+    S.vacForm = newVacForm();
+    render(true);
+  }
+
+  function useGps() {
+    if (!navigator.geolocation) { toast("Dieses Gerät kann den Standort nicht ermitteln."); return; }
+    toast("Standort wird ermittelt …");
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      S.draft.location = L.normalizeLocation({ lat: Math.round(pos.coords.latitude * 100) / 100, lon: Math.round(pos.coords.longitude * 100) / 100, label: "Mein Standort" });
+      toast("Standort übernommen. Zum Übernehmen noch speichern.");
+      if (S.tab === "times") render(true);
+    }, function () {
+      toast("Der Standort war nicht verfügbar. Bitte einen Ort aus der Liste wählen.");
+    }, { timeout: 12000, maximumAge: 600000 });
   }
 
   function askRemove(i) {
@@ -1028,6 +1422,51 @@
       case "clear-override": removeOverride(el.dataset.name); break;
       case "dismiss-pending": delete S.pending[el.dataset.key]; render(true); if (S.tab !== "times") refresh(true); break;
       case "add-cat": addCat(); break;
+      case "choose-pet": {
+        var sp = S.sheet; if (!sp) return;
+        var pi = +el.dataset.idx, nm = pi >= 0 ? sp.names[pi] : ""; S.sheet = null;
+        addCatNamed(nm);
+        break;
+      }
+      case "open-bulk": {
+        var bl = el.dataset.locked === "1";
+        S.sheet = { kind: "bulk", wantLocked: bl, options: L.bulkChoices(bl) };
+        render();
+        break;
+      }
+      case "choose-bulk": {
+        var sb = S.sheet; if (!sb) return;
+        var ob = sb.options[+el.dataset.idx]; S.sheet = null;
+        changeBulk(sb.wantLocked, ob.key);
+        break;
+      }
+      case "clear-all-overrides": clearAllOverrides(); break;
+      case "cat-mode": setCatMode(+el.dataset.idx, el.dataset.mode); break;
+      case "toggle-day": toggleDay(+el.dataset.idx, +el.dataset.rule, +el.dataset.day); break;
+      case "days-preset": daysPreset(+el.dataset.idx, +el.dataset.rule, el.dataset.preset); break;
+      case "add-rule": {
+        var cr = S.draft.cats[+el.dataset.idx];
+        cr.rules.push(L.newRule());
+        render(true);
+        break;
+      }
+      case "remove-rule": {
+        var cr2 = S.draft.cats[+el.dataset.idx];
+        cr2.rules.splice(+el.dataset.rule, 1);
+        render(true);
+        break;
+      }
+      case "vac-cat": {
+        var f = S.vacForm || (S.vacForm = newVacForm()), nmv = el.dataset.name;
+        if (!nmv) f.cats = [];
+        else { var at = f.cats.indexOf(nmv); if (at >= 0) f.cats.splice(at, 1); else f.cats.push(nmv); }
+        render(true);
+        break;
+      }
+      case "vac-state": (S.vacForm || (S.vacForm = newVacForm())).state = el.dataset.state; render(true); break;
+      case "add-vac": addVacation(); break;
+      case "remove-vac": S.draft.vacations.splice(+el.dataset.idx, 1); render(true); break;
+      case "geolocate": useGps(); break;
       case "remove-cat": askRemove(+el.dataset.idx); break;
       case "save-times": saveTimes(); break;
       case "diag": runDiag(); break;
@@ -1058,13 +1497,41 @@
   });
 
   $app.addEventListener("input", function (ev) {
-    var t = ev.target, f = t.dataset && t.dataset.field;
-    if (!f || !S.draft || f === "enabled") return;
-    S.draft.cats[+t.dataset.idx][f] = t.value;
+    var t = ev.target, ds = t.dataset || {};
+    if (!S.draft) return;
+    if (ds.vac) {
+      var f2 = S.vacForm || (S.vacForm = newVacForm());
+      f2[ds.vac] = t.value;
+      if (ds.vac === "from") { var to = document.getElementById("vac-to"); if (to) to.min = t.value || clockNaive().slice(0, 10); }
+      return;
+    }
+    if (ds.locfield) {
+      var v = parseFloat(t.value);
+      S.draft.location = Object.assign({}, S.draft.location || {}, { label: "Eigene Koordinaten" });
+      S.draft.location[ds.locfield] = isNaN(v) ? "" : v;
+      updateScheduleUi();
+      return;
+    }
+    var f = ds.field;
+    if (!f || f === "enabled" || ds.when) return;
+    var cat = S.draft.cats[+ds.idx];
+    (ds.rule != null ? cat.rules[+ds.rule] : cat)[f] = t.value;
     updateScheduleUi();
   });
   $app.addEventListener("change", function (ev) {
     var t = ev.target;
+    if (t.dataset && t.dataset.when && S.draft) { changeWhen(t); return; }
+    if (t.dataset && t.dataset.loc === "city" && S.draft) {
+      var val = t.value;
+      if (val === "none") S.draft.location = null;
+      else if (val === "custom") S.draft.location = L.normalizeLocation({ lat: (S.draft.location || { lat: 52.52 }).lat, lon: (S.draft.location || { lon: 13.405 }).lon, label: "Eigene Koordinaten" });
+      else if (val === "gps") { useGps(); return; }
+      else { var c = CITIES[+val.slice(1)]; S.draft.location = { lat: c[1], lon: c[2], label: c[0] }; }
+      render(true);
+      var again = document.getElementById("loc-city");
+      if (again) again.focus();
+      return;
+    }
     if (t.dataset && t.dataset.alert && S.draft) {
       var key = t.dataset.alert, id = t.id;
       S.draft.alerts[key] = key === "enabled" ? !!t.checked : parseInt(t.value, 10) || 0;
@@ -1115,6 +1582,13 @@
       await tryConnect(cfg);
       return true;
     }
+    var sc = /^#(lockall|freeall|history|times|home)$/.exec(hash);
+    if (sc) {
+      history.replaceState(null, "", location.pathname + location.search);
+      S.shortcut = sc[1];
+      if (S.cfg && S.api) { applyShortcut(); return true; }
+      return false; // noch nicht verbunden: nach dem Start anwenden
+    }
     if (/^#demo/.test(hash)) {
       history.replaceState(null, "", location.pathname + location.search);
       await startDemo();
@@ -1123,10 +1597,27 @@
     return false;
   }
 
+  // Kurzbefehle vom Startbildschirm (#lockall, #freeall, #history, #times): oeffnen nur den Dialog bzw. Reiter
+  function applyShortcut() {
+    var name = S.shortcut; S.shortcut = null;
+    if (!name || !S.cfg) return;
+    if (name === "lockall" || name === "freeall") {
+      S.tab = "home";
+      if (((S.status && S.status.cats) || []).length) {
+        var bl = name === "lockall";
+        S.sheet = { kind: "bulk", wantLocked: bl, options: L.bulkChoices(bl) };
+      }
+    } else {
+      S.tab = name;
+    }
+    render(true);
+    window.scrollTo(0, 0);
+  }
+
   async function boot() {
     if (await handleHash()) return;
     var stored = loadCfg();
-    if (stored) { await startApp(stored, new L.GitHub(stored), false); return; }
+    if (stored) { await startApp(stored, new L.GitHub(stored), false); applyShortcut(); return; }
     render();
   }
 
