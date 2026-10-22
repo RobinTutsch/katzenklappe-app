@@ -17,6 +17,7 @@
   var WORKFLOW_FILE = "katzenklappe.yml";
   var STATUS_BRANCH = "status";
   var STATUS_FILE = "status.json";
+  var HISTORY_FILE = "history.json";
   var VAR_SCHEDULE = "SCHEDULE_JSON";
   var VAR_OVERRIDES = "OVERRIDES_JSON";
 
@@ -105,6 +106,19 @@
       .then(function (r) {
         if (r.status === 404) return null;
         try { return JSON.parse(r.text); } catch (e) { throw ApiError("other", 0, "status.json ist kein gueltiges JSON"); }
+      });
+  };
+
+  // Verlauf (Durchgaenge, Sperren) vom Branch "status": Liste, neueste zuerst; [] wenn es noch keinen gibt.
+  // Ein kaputter oder fehlender Verlauf darf die App nie am Laden hindern.
+  GitHub.prototype.getHistory = function () {
+    return this.req("GET", "/contents/" + HISTORY_FILE + "?ref=" + STATUS_BRANCH, undefined, { raw: true, allowNotFound: true })
+      .then(function (r) {
+        if (r.status === 404) return [];
+        try {
+          var d = JSON.parse(r.text);
+          return d && Array.isArray(d.events) ? d.events.filter(function (e) { return e && e.t && e.k; }) : [];
+        } catch (e) { return []; }
       });
   };
 

@@ -7,7 +7,7 @@
   var CFG_KEY = "klappe.cfg.v1";
   var CACHE_KEY = "klappe.cache.v1";
   var HINT_KEY = "klappe.hint.install";
-  var VERSION = "1.0";
+  var VERSION = "1.1";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -15,7 +15,8 @@
   var S = {
     cfg: null, api: null, demo: false,
     tab: "home",
-    status: null, runs: null, overrides: null, loading: false, error: null, fetchedAt: null, fromCache: false,
+    status: null, runs: null, overrides: null, history: null, histFilter: null, histShown: 30,
+    loading: false, error: null, fetchedAt: null, fromCache: false,
     pending: {},
     sheet: null,
     toast: null,
@@ -60,7 +61,12 @@
     info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.6v.01"/></svg>',
     warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.4v.01"/></svg>',
     ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
-    no: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>'
+    no: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 6.5H20M8.5 12H20M8.5 17.5H20"/><circle cx="4.5" cy="6.5" r=".9" fill="currentColor"/><circle cx="4.5" cy="12" r=".9" fill="currentColor"/><circle cx="4.5" cy="17.5" r=".9" fill="currentColor"/></svg>',
+    out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M9 7h8v8"/></svg>',
+    inn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 7L7 17M15 17H7V9"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/></svg>',
+    unlock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 6.6-1.4"/></svg>'
   };
 
   /* ---------- Speicher ---------- */
@@ -77,7 +83,8 @@
 
   function cacheSave() {
     if (S.demo || !S.cfg || !S.status) return;
-    lsSet(CACHE_KEY, JSON.stringify({ key: S.cfg.owner + "/" + S.cfg.repo, status: S.status, runs: S.runs, at: S.fetchedAt }));
+    lsSet(CACHE_KEY, JSON.stringify({ key: S.cfg.owner + "/" + S.cfg.repo, status: S.status, runs: S.runs, at: S.fetchedAt,
+      history: S.history ? S.history.slice(0, 80) : null }));
   }
   function cacheLoad() {
     var raw = lsGet(CACHE_KEY);
@@ -93,11 +100,15 @@
   function startApp(cfg, api, demo) {
     S.cfg = cfg; S.api = api; S.demo = !!demo;
     S.status = null; S.runs = null; S.error = null; S.fetchedAt = null; S.fromCache = false;
+    S.history = null; S.histFilter = null; S.histShown = 30;
     S.pending = {}; S.sheet = null; S.draft = null; S.saved = null; S.scheduleLoaded = false; S.scheduleError = null;
     S.tab = "home";
     if (!demo) {
       var cached = cacheLoad();
-      if (cached) { S.status = cached.status; S.runs = cached.runs; S.fetchedAt = cached.at; S.fromCache = true; }
+      if (cached) {
+        S.status = cached.status; S.runs = cached.runs; S.fetchedAt = cached.at; S.fromCache = true;
+        S.history = Array.isArray(cached.history) ? cached.history : null;
+      }
     }
     render();
     return refresh(true);
@@ -130,22 +141,25 @@
 
   function logout() {
     lsDel(CFG_KEY); lsDel(CACHE_KEY);
-    S.cfg = null; S.api = null; S.demo = false; S.status = null; S.runs = null; S.pending = {};
+    S.cfg = null; S.api = null; S.demo = false; S.status = null; S.runs = null; S.history = null; S.pending = {};
     S.setupError = ""; S.tab = "home";
     render();
   }
 
   /* ---------- Daten holen ---------- */
 
-  async function fetchState() {
+  // light = ohne Verlauf (beim Warten auf einen Lauf wird er nicht gebraucht)
+  async function fetchState(light) {
     var res = await Promise.all([
       S.api.getStatus(),
       S.api.runs().catch(function () { return null; }),
-      S.api.getOverrides().catch(function () { return null; })
+      S.api.getOverrides().catch(function () { return null; }),
+      light || !S.api.getHistory ? Promise.resolve(null) : S.api.getHistory().catch(function () { return null; })
     ]);
     S.status = res[0];
     if (res[1]) S.runs = res[1];
     S.overrides = res[2];
+    if (Array.isArray(res[3])) S.history = res[3];
     S.fetchedAt = Date.now();
     S.fromCache = false;
     cacheSave();
@@ -203,6 +217,7 @@
     if (f && f.conclusion && f.conclusion !== "success") return { tone: "warn", label: "Lauf fehlgeschlagen" };
     if (isStale()) return { tone: "warn", label: "Lauf fehlt" };
     if ((st.problems || []).length) return { tone: "warn", label: "Hinweis" };
+    if ((st.warnings || []).length) return { tone: "warn", label: "Warnung" };
     return { tone: "ok", label: "Alles in Ordnung" };
   }
 
@@ -265,6 +280,11 @@
       out += noteHtml("warn", "Der Zeitplan hat sich länger nicht gemeldet.",
         ["Der letzte Lauf war " + L.agoLabel(m) + ". Bei GitHub unter „Actions“ nachsehen, ob der Zeitplan noch aktiv ist."]);
     }
+    var tz = st.timezone || L.DEFAULT_TZ, nowMs = Date.now();
+    (st.warnings || []).forEach(function (w) {
+      var text = L.warningText(w, tz, nowMs);
+      if (text) out += noteHtml(w.level === "bad" ? "bad" : "warn", L.warningTitle(w), [text]);
+    });
     return out;
   }
 
@@ -333,14 +353,28 @@
       " bis " + L.whenLabel(naive, saved.until) + ". Das wird beim nächsten Lauf übernommen.";
   }
 
+  function descOpts() {
+    var st = S.status || {};
+    return { lead: st.lead_minutes || 0, tz: st.timezone || L.DEFAULT_TZ, nowMs: Date.now() };
+  }
+
+  // Aktivitaet eines Tieres aus dem Verlauf (null, solange der Verlauf fehlt)
+  function activityOf(pet) {
+    if (!S.history) return null;
+    var o = descOpts();
+    return L.activityFor(S.history, pet, o.tz, o.nowMs, 7);
+  }
+
   function catCardHtml(c, naive) {
-    var d = L.describeCat(c, naive);
+    var d = L.describeCat(c, naive, descOpts());
+    var activity = L.activityLine(activityOf(c));
     var p = S.pending[c.name];
     var html = '<section class="cat" data-tone="' + d.tone + '" aria-label="' + esc(c.name) + '">' +
       '<div class="cat-head"><h2 class="cat-name">' + esc(c.name) + "</h2>" + (d.tone === "night" ? I.moon : I.sun) + "</div>" +
       '<p class="cat-state">' + esc(d.headline) + "</p>" +
       (d.sub ? '<p class="cat-sub">' + esc(d.sub) + "</p>" : "") +
       (d.locationText ? '<p class="cat-where">' + esc(d.locationText) + "</p>" : "") +
+      (activity ? '<p class="cat-activity">' + esc(activity) + "</p>" : "") +
       barHtml(c.lock, c.unlock, naive) +
       (d.override ? '<p class="cat-override">' + esc(d.overrideLabel) + "</p>" : "");
     var queued = p ? "" : queuedLabel(c, naive);
@@ -356,16 +390,167 @@
     return html + "</section>";
   }
 
+  function othersHtml() {
+    var st = S.status;
+    if (!st || !(st.pets || []).length) return "";
+    var scheduled = (st.cats || []).map(function (c) { return c.name.trim().toLowerCase(); });
+    var others = st.pets.filter(function (p) { return scheduled.indexOf(p.name.trim().toLowerCase()) < 0; });
+    if (!others.length) return "";
+    var o = descOpts();
+    return '<section class="card" aria-label="Weitere Tiere"><h2 class="card-title">Weitere Tiere</h2>' +
+      '<p class="card-sub">Ohne Zeitplan in dieser App.</p><ul class="pet-list">' +
+      others.map(function (p) {
+        var where = p.location === "inside" ? "drinnen" : p.location === "outside" ? "draußen" : "";
+        var since = where && p.location_since ? " " + L.sinceLabel(p.location_since, o.tz, o.nowMs) : "";
+        var act = L.activityLine(activityOf(p));
+        return '<li class="pet-row"><span class="pet-dot" data-where="' + esc(p.location || "unknown") + '"></span><div>' +
+          "<strong>" + esc(p.name) + "</strong>" +
+          '<span class="pet-where">' + (where ? esc(where + since) : "Ort unbekannt") + "</span>" +
+          (act ? '<span class="pet-act">' + esc(act) + "</span>" : "") + "</div></li>";
+      }).join("") + "</ul></section>";
+  }
+
+  function gaugeHtml(d, warnAt) {
+    var pct = d.battery_pct, tone = L.batteryTone(pct, warnAt);
+    var volts = typeof d.battery_v === "number" ? String(d.battery_v).replace(".", ",") + " Volt. " : "";
+    return '<div class="gauge" data-tone="' + tone + '">' +
+      '<div class="gauge-row"><span>Batterie</span><strong>' + (pct == null ? "unbekannt" : pct + " %") + "</strong></div>" +
+      (pct == null ? "" : '<div class="gauge-track" role="img" aria-label="Batterie ' + pct + ' Prozent"><span style="width:' + pct + '%"></span></div>') +
+      '<p class="gauge-sub">' + esc(volts + "Die Prozentzahl ist aus der Spannung geschätzt.") + "</p></div>";
+  }
+
+  function signalHtml(db) {
+    var lvl = L.signalLevel(db);
+    return '<div class="sig-row"><span>Funkverbindung</span><span class="sig-val">' +
+      '<span class="sig" data-level="' + lvl + '" aria-hidden="true"><i></i><i></i><i></i><i></i></span>' +
+      "<strong>" + esc(L.signalLabel(db)) + "</strong></span></div>";
+  }
+
+  function devicesHtml() {
+    var st = S.status, devs = (st && st.devices) || [];
+    if (!devs.length) return "";
+    var a = st.alerts || {};
+    var warnAt = a.enabled === false ? 0 : (a.battery_percent == null ? L.DEFAULT_ALERTS.battery_percent : a.battery_percent);
+    var html = '<section class="card" aria-label="Klappe und Hub"><h2 class="card-title">Klappe und Hub</h2>';
+    devs.filter(function (d) { return d.kind === "flap"; }).forEach(function (d) {
+      html += gaugeHtml(d, warnAt) + (typeof d.signal_db === "number" ? signalHtml(d.signal_db) : "");
+    });
+    html += '<ul class="dev-list">' + devs.map(function (d) {
+      var kind = d.kind === "flap" ? "Klappe" : d.kind === "hub" ? "Hub" : "Gerät";
+      var state = d.online === true ? "online" : d.online === false ? "offline" : "unbekannt";
+      return '<li><span class="dot" data-on="' + (d.online === true ? "1" : d.online === false ? "0" : "") + '"></span>' +
+        "<span>" + esc(kind + (d.name ? " „" + d.name + "“" : "")) + "</span><small>" + state + "</small></li>";
+    }).join("") + "</ul></section>";
+    return html;
+  }
+
   function viewHome() {
     var naive = clockNaive();
     var cats = (S.status && S.status.cats) || [];
     var html = headerHtml() + bannersHtml();
     cats.forEach(function (c) { html += catCardHtml(c, naive); });
+    html += othersHtml() + devicesHtml();
     var ago = lastCheckLabel();
     html += '<div class="meta"><span>' +
       (S.loading ? "Wird aktualisiert …" : (ago ? "Zuletzt geprüft " + esc(ago) : "")) +
       '</span><button data-action="refresh">Aktualisieren</button></div>';
     html += '<div style="height:16px"></div>' + installHintHtml();
+    return html;
+  }
+
+  /* ----- Verlauf ----- */
+
+  var DAY_SHORT = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+
+  function historyNames() {
+    var st = S.status || {}, seen = {}, out = [];
+    function add(n) {
+      var k = String(n || "").trim().toLowerCase();
+      if (k && !seen[k]) { seen[k] = true; out.push(String(n).trim()); }
+    }
+    (st.cats || []).forEach(function (c) { add(c.name); });
+    (st.pets || []).forEach(function (p) { add(p.name); });
+    (S.history || []).forEach(function (e) { add(e.cat); });
+    return out;
+  }
+
+  function petOrStub(name) {
+    var st = S.status || {}, key = name.trim().toLowerCase(), i, list = (st.pets || []).concat(st.cats || []);
+    for (i = 0; i < list.length; i++) if (list[i].name.trim().toLowerCase() === key) return list[i];
+    return { name: name, location: "unknown", location_since: null };
+  }
+
+  function weekHtml(name) {
+    var pet = petOrStub(name), act = activityOf(pet);
+    if (!act || !act.hasData) return "";
+    var o = descOpts();
+    var firstDay = act.firstT ? L.utcToNaive(act.firstT, o.tz).slice(0, 10) : "9999-99-99";
+    var max = Math.max(60, Math.max.apply(null, act.perDay.map(function (d) { return d.minutes; })));
+    // Durchschnitt nur aus vollen Tagen (ohne heute) und erst, wenn es mindestens zwei davon gibt
+    var done = act.perDay.slice(0, -1).filter(function (d) { return d.date > firstDay; });
+    var total = done.reduce(function (n, d) { return n + d.minutes; }, 0);
+    var known = done.length;
+    var cols = act.perDay.map(function (d, i) {
+      var isKnown = d.date >= firstDay, h = isKnown ? Math.max(d.minutes ? 4 : 0, Math.round(d.minutes / max * 100)) : 0;
+      var label = i === act.perDay.length - 1 ? "heute" : DAY_SHORT[L.toDate(d.date + "T00:00").getUTCDay()];
+      return '<li class="wk-col" data-known="' + (isKnown ? "1" : "0") + '"><span class="wk-val">' +
+        esc(isKnown ? L.durationShort(d.minutes) : "–") + '</span><span class="wk-bar"><i style="height:' + h + '%"></i></span>' +
+        '<span class="wk-day">' + esc(label) + "</span></li>";
+    }).join("");
+    return '<section class="card" aria-label="Draußen pro Tag, ' + esc(name) + '"><h2 class="card-title">' + esc(name) + ": Zeit draußen</h2>" +
+      '<p class="card-sub">Pro Tag, die letzten 7 Tage' +
+      (known >= 2 ? ". Im Schnitt " + esc(L.durationLabel(total / known).replace(/\.$/, "")) + " am Tag." : ". Der Verlauf füllt sich mit jedem Tag.") +
+      '</p><ol class="week">' + cols + "</ol></section>";
+  }
+
+  function eventRowHtml(r) {
+    var icon = r.kind === "lock" ? (r.e.to === "locked" ? I.lock : I.unlock) : r.dir === "out" ? I.out : I.inn;
+    var tone = r.kind === "lock" ? "lock" : r.dir === "out" ? "out" : "in";
+    return '<li class="ev" data-kind="' + tone + '"><span class="ev-time">' + esc(r.time) + '</span><span class="ev-icon">' + icon +
+      '</span><span class="ev-text">' + esc(r.text) +
+      (r.outMin != null ? "<small>war " + esc(L.durationLabel(r.outMin)) + " draußen</small>" : "") + "</span></li>";
+  }
+
+  function viewHistory() {
+    var html = '<h1 class="page-title">Verlauf</h1>';
+    if (!S.status && !S.history) {
+      return html + (S.error ? noteHtml("bad", "Der Verlauf konnte nicht geladen werden.", [L.errorText(S.error)],
+        '<button class="note-btn" data-action="refresh">Nochmal versuchen</button>') : '<p class="muted">Wird geladen …</p>');
+    }
+    if (!S.history) {
+      return html + noteHtml("info", "Der Verlauf ist noch nicht da.", ["Er wird mit dem nächsten Aktualisieren geladen."],
+        '<button class="note-btn" data-action="refresh">Aktualisieren</button>');
+    }
+    var names = historyNames();
+    var filter = S.histFilter && names.indexOf(S.histFilter) >= 0 ? S.histFilter : null;
+    html += '<div class="chips" role="group" aria-label="Tier wählen">' +
+      ['<button class="chip" data-action="hist-filter" data-name="" aria-pressed="' + (filter ? "false" : "true") + '">Alle</button>']
+        .concat(names.map(function (n) {
+          return '<button class="chip" data-action="hist-filter" data-name="' + esc(n) + '" aria-pressed="' + (filter === n ? "true" : "false") + '">' + esc(n) + "</button>";
+        })).join("") + "</div>";
+    (filter ? [filter] : names).forEach(function (n) { html += weekHtml(n); });
+
+    var o = descOpts(), nowNv = L.nowNaive(o.tz);
+    var rows = L.annotateEvents(S.history, o.tz).filter(function (r) { return !filter || r.name === filter; });
+    if (!rows.length) {
+      html += '<p class="muted">Noch keine Einträge. Sobald die Klappe benutzt wird, erscheint es hier.</p>';
+    } else {
+      var shown = rows.slice(0, S.histShown), lastDate = null;
+      html += '<h2 class="list-title">Letzte Ereignisse</h2>';
+      shown.forEach(function (r) {
+        if (r.date !== lastDate) {
+          if (lastDate !== null) html += "</ul>";
+          html += '<h3 class="day-title">' + esc(L.dayHeading(nowNv, r.date)) + '</h3><ul class="events">';
+          lastDate = r.date;
+        }
+        html += eventRowHtml(r);
+      });
+      html += "</ul>";
+      if (rows.length > shown.length) {
+        html += '<div class="stack"><button class="btn btn-quiet btn-wide" data-action="hist-more">Mehr anzeigen (' + (rows.length - shown.length) + ")</button></div>";
+      }
+    }
+    html += '<p class="muted small">Der Verlauf kommt aus der Sure-Cloud und wird bei jedem Lauf ergänzt (etwa alle 30 Minuten). Die letzten drei Wochen bleiben gespeichert.</p>';
     return html;
   }
 
@@ -405,6 +590,27 @@
       "</section>";
   }
 
+  function alertSelectHtml(key, label) {
+    var a = S.draft.alerts;
+    return '<div class="sel-row"><label for="a-' + key + '">' + esc(label) + '</label>' +
+      '<select class="select" id="a-' + key + '" data-alert="' + key + '"' + (a.enabled ? "" : " disabled") + ">" +
+      L.alertChoices(key, a[key]).map(function (o) {
+        return '<option value="' + o.value + '"' + (o.selected ? " selected" : "") + ">" + esc(o.label) + "</option>";
+      }).join("") + "</select></div>";
+  }
+
+  function alertsEditHtml() {
+    var a = S.draft.alerts;
+    return '<section class="section"><h2>Warnungen</h2>' +
+      "<p>Meldungen aufs Handy und Hinweise in der App, wenn etwas nicht stimmt.</p>" +
+      '<div class="switch-row switch-flush"><div><strong>Warnungen aktiv</strong></div>' +
+      '<label class="switch"><span class="sr">Warnungen aktiv</span><input type="checkbox" id="a-enabled" data-alert="enabled"' + (a.enabled ? " checked" : "") + "><span></span></label></div>" +
+      alertSelectHtml("outside_after_lock_min", "Noch draußen, obwohl gesperrt, nach") +
+      alertSelectHtml("outside_long_hours", "Sehr lange draußen ab") +
+      alertSelectHtml("battery_percent", "Batterie schwach ab") +
+      '<p class="muted small">Bei „Aus“ gibt es diese Warnung nicht. Dass die Klappe oder der Hub offline ist, wird immer gemeldet.</p></section>';
+  }
+
   async function loadSchedule() {
     if (S.scheduleLoaded || S.scheduleLoading) return;
     S.scheduleLoading = true;
@@ -413,6 +619,7 @@
       if (!raw && S.status) {
         raw = {
           enabled: !S.status.paused, timezone: S.status.timezone,
+          lead_minutes: S.status.lead_minutes, alerts: S.status.alerts,
           cats: (S.status.cats || []).map(function (c) { return { name: c.name, lock: c.lock, unlock: c.unlock }; })
         };
       }
@@ -439,6 +646,7 @@
     html += '<div id="times-status">' + timesStatusHtml() + "</div>";
     S.draft.cats.forEach(function (c, i) { html += catEditHtml(c, i, naive); });
     html += '<div class="stack"><button class="btn btn-quiet btn-wide" data-action="add-cat">Tier hinzufügen</button></div>';
+    html += alertsEditHtml();
     html += '<div class="switch-row" style="margin-top:20px"><div><strong>Zeitplan aktiv</strong><p>Ausgeschaltet bleibt die Klappe, wie sie ist (z. B. beim Tierarzt).</p></div>' +
       '<label class="switch"><span class="sr">Zeitplan aktiv</span><input type="checkbox" data-field="enabled"' + (S.draft.enabled ? " checked" : "") + "><span></span></label></div>";
     html += '<div class="savebar" id="savebar">' + saveBarHtml() + "</div>";
@@ -485,6 +693,10 @@
       '<details class="help"><summary>Was macht „Jetzt rauslassen“?</summary><p>Du hebst die Sperre für eine Weile auf, zum Beispiel für eine Stunde. Danach gilt wieder der Zeitplan. Eine laufende Sonderregel kannst du jederzeit beenden.</p></details>' +
       '<details class="help"><summary>Warum dauert es etwa eine Minute?</summary><p>Die App gibt den Auftrag an einen kleinen Dienst weiter, der ihn über die Sure-Cloud an den Hub schickt. Das braucht ein bis zwei Minuten. Die App darf in der Zeit geschlossen werden.</p></details>' +
       '<details class="help"><summary>Was, wenn ich in der Sure-App etwas ändere?</summary><p>Beim nächsten Lauf (alle 30 Minuten) stellt der Zeitplan die Klappe wieder so, wie es hier eingestellt ist. Für Ausnahmen die Sonderregeln hier benutzen. Die Zeitschaltuhr in der Sure-App am besten ausgeschaltet lassen.</p></details>' +
+      '<details class="help"><summary>Warum schaltet die Klappe manchmal ein paar Minuten früher?</summary><p>GitHub startet den Zeitplan nicht immer pünktlich, manchmal erst nach vielen Minuten. Damit trotzdem rechtzeitig gesperrt oder freigegeben wird, gilt der Zeitplan bis zu 8 Minuten früher als eingestellt.</p></details>' +
+      '<details class="help"><summary>Was bedeuten die Warnungen?</summary><p>Die App meldet sich, wenn ein Tier trotz Sperre noch draußen ist, sehr lange draußen bleibt, die Batterie der Klappe schwächer wird oder die Klappe oder der Hub offline ist. Auf dem Handy kommt die Meldung per ntfy, in der App steht sie oben in der Übersicht. Wann gewarnt wird, stellst du unter „Zeiten“ ein.</p></details>' +
+      '<details class="help"><summary>Wie genau ist die Batterieanzeige?</summary><p>Die Klappe meldet nur ihre Spannung. Daraus wird der Prozentwert geschätzt, so wie es auch andere Programme für die Klappe machen. Er ist eine Orientierung, kein Messgerät. Bei etwa 25 Prozent solltest du neue Batterien bereitlegen.</p></details>' +
+      '<details class="help"><summary>Woher kommt der Verlauf?</summary><p>Die Sure-Cloud merkt sich jeden Durchgang an der Klappe. Der Zeitplan holt diese Einträge bei jedem Lauf ab und speichert sie drei Wochen lang. In Echtzeit ist das nicht: Ein Eintrag erscheint erst beim nächsten Lauf.</p></details>' +
       '<details class="help"><summary>Was, wenn der Hub keinen Strom hat?</summary><p>Dann kommt kein Befehl bei der Klappe an. Die App zeigt „Hub offline“ an, sobald der Dienst das bemerkt.</p></details>' +
       "</section>";
     if (!S.demo) {
@@ -546,7 +758,7 @@
         '<span class="nav-pill">' + icon + "</span>" + label + "</button>";
     }
     return '<nav class="nav" aria-label="Hauptmenü"><div class="nav-inner">' +
-      item("home", "Übersicht", I.home) + item("times", "Zeiten", I.clock) + item("more", "Mehr", I.more) + "</div></nav>";
+      item("home", "Übersicht", I.home) + item("history", "Verlauf", I.list) + item("times", "Zeiten", I.clock) + item("more", "Mehr", I.more) + "</div></nav>";
   }
 
   function render(force) {
@@ -559,7 +771,7 @@
     if (!S.cfg) {
       html = viewSetup();
     } else {
-      html = (S.tab === "home" ? viewHome() : S.tab === "times" ? viewTimes() : viewMore()) + navHtml();
+      html = (S.tab === "home" ? viewHome() : S.tab === "history" ? viewHistory() : S.tab === "times" ? viewTimes() : viewMore()) + navHtml();
     }
     $app.innerHTML = html + sheetHtml() + toastHtml();
     var focus = $app.querySelector(".sheet .opt");
@@ -611,7 +823,7 @@
       await sleep(POLL_MS);
       if (S.pending[key] !== token) return;
       try {
-        var res = await fetchState();
+        var res = await fetchState(true);
         S.error = null;
         if (isDone(S.status)) {
           delete S.pending[key];
@@ -642,7 +854,7 @@
   function catSummary(name) {
     return function (st) {
       var c = catByName(st, name);
-      return c ? name + ": " + L.describeCat(c, clockNaive()).headline : name;
+      return c ? name + ": " + L.describeCat(c, clockNaive(), descOpts()).headline : name;
     };
   }
 
@@ -677,6 +889,7 @@
     return function (st) {
       if (!st || st.config_ok === false) return false;
       if (!!st.paused !== !draft.enabled) return false;
+      if (st.alerts && !L.sameAlerts(st.alerts, draft.alerts)) return false;
       var cats = st.cats || [];
       if (cats.length !== draft.cats.length) return false;
       return draft.cats.every(function (d) {
@@ -787,6 +1000,8 @@
       case "goto-more": S.tab = "more"; render(true); window.scrollTo(0, 0); break;
       case "refresh": refresh(false); break;
       case "retry-times": S.scheduleError = null; render(); break;
+      case "hist-filter": S.histFilter = el.dataset.name || null; S.histShown = 30; render(true); break;
+      case "hist-more": S.histShown += 30; render(true); break;
       case "run-now": runNow(); break;
       case "open-sheet": {
         var name = el.dataset.name, wantLocked = el.dataset.locked === "1";
@@ -850,6 +1065,15 @@
   });
   $app.addEventListener("change", function (ev) {
     var t = ev.target;
+    if (t.dataset && t.dataset.alert && S.draft) {
+      var key = t.dataset.alert, id = t.id;
+      S.draft.alerts[key] = key === "enabled" ? !!t.checked : parseInt(t.value, 10) || 0;
+      S.draft.alerts = L.normalizeAlerts(S.draft.alerts);
+      render(true);
+      var again = id && document.getElementById(id);
+      if (again) again.focus();
+      return;
+    }
     if (t.dataset && t.dataset.field === "enabled" && S.draft) {
       S.draft.enabled = t.checked;
       updateScheduleUi();
@@ -869,7 +1093,7 @@
   });
   setInterval(function () {
     if (document.hidden || !S.api) return;
-    if (S.tab === "home" && !S.sheet) {
+    if ((S.tab === "home" || S.tab === "history") && !S.sheet) {
       if (!S.fetchedAt || Date.now() - S.fetchedAt > 300000) refresh(true); else render();
     }
   }, 60000);

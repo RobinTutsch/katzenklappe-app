@@ -125,8 +125,13 @@
     return d === 1 ? "vor 1 Tag" : "vor " + d + " Tagen";
   }
 
-  /* Anzeige-Modell fuer eine Katze (cat = Eintrag aus status.json) */
-  function describeCat(cat, naive) {
+  /* Anzeige-Modell fuer eine Katze (cat = Eintrag aus status.json).
+   * opts: {lead: Minuten Schaltzeit-Toleranz, tz: Zeitzone, nowMs: jetzt}. Der Zeitplan gilt so, als waere es `lead`
+   * Minuten spaeter (wie im Zeitplan-Dienst); die Tageswoerter ("heute", "morgen") beziehen sich auf die echte Zeit. */
+  function describeCat(cat, naive, opts) {
+    opts = typeof opts === "number" ? { lead: opts } : (opts || {});
+    var real = naive;
+    naive = opts.lead ? addMinutes(naive, opts.lead) : naive;
     var want = desired(cat, naive);
     var actual = cat.locked; // true / false / null (unbekannt)
     var shownLocked = actual === null || actual === undefined ? want.locked : actual;
@@ -140,17 +145,19 @@
         ? "Die Sperre wird beim nächsten Lauf gesetzt."
         : "Die Sperre wird beim nächsten Lauf aufgehoben.";
     } else if (change) {
-      sub = "bis " + whenLabel(naive, change.at);
+      sub = "bis " + whenLabel(real, change.at);
     }
 
     var location = cat.location === "inside" ? "inside" : cat.location === "outside" ? "outside" : "unknown";
     var locationText = "";
+    var since = cat.location_since && opts.tz && opts.nowMs != null
+      ? " (" + sinceLabel(cat.location_since, opts.tz, opts.nowMs) + ")" : "";
     if (location === "outside") {
       locationText = shownLocked
-        ? cat.name + " ist noch draußen und kann nur noch hinein."
-        : cat.name + " ist gerade draußen.";
+        ? cat.name + " ist noch draußen" + since + " und kann nur noch hinein."
+        : cat.name + " ist gerade draußen" + since + ".";
     } else if (location === "inside") {
-      locationText = cat.name + " ist gerade drinnen.";
+      locationText = cat.name + " ist gerade drinnen" + since + ".";
     }
 
     return {
@@ -165,7 +172,7 @@
       override: override,
       overrideLabel: override
         ? (override.state === "locked" ? "Sonderregel: drinnen bleiben" : "Sonderregel: draußen erlaubt") +
-          " bis " + whenLabel(naive, override.until)
+          " bis " + whenLabel(real, override.until)
         : "",
       next: change
     };
@@ -223,8 +230,29 @@
 
   /* ---------- Zeitplan-Datei (Variable SCHEDULE_JSON) ---------- */
 
+  var DEFAULT_ALERTS = { enabled: true, outside_after_lock_min: 30, outside_long_hours: 12, battery_percent: 25 };
+  var DEFAULT_LEAD = 8;
+
+  function clampInt(v, low, high, dflt) {
+    var n = parseInt(v, 10);
+    return isNaN(n) ? dflt : Math.max(low, Math.min(high, n));
+  }
+
+  // Warn-Einstellungen: fehlende/unsinnige Werte -> Standard, null/0/false = aus
+  function normalizeAlerts(raw) {
+    var out = {};
+    for (var k in DEFAULT_ALERTS) out[k] = DEFAULT_ALERTS[k];
+    if (!raw || typeof raw !== "object") return out;
+    if ("enabled" in raw) out.enabled = !!raw.enabled;
+    [["outside_after_lock_min", 720], ["outside_long_hours", 72], ["battery_percent", 100]].forEach(function (p) {
+      if (p[0] in raw) out[p[0]] = (raw[p[0]] === null || raw[p[0]] === false) ? 0 : clampInt(raw[p[0]], 0, p[1], DEFAULT_ALERTS[p[0]]);
+    });
+    return out;
+  }
+
   function emptySchedule() {
-    return { enabled: true, timezone: DEFAULT_TZ, alert_window_minutes: 45, cats: [] };
+    return { enabled: true, timezone: DEFAULT_TZ, alert_window_minutes: 45, lead_minutes: DEFAULT_LEAD,
+      alerts: normalizeAlerts(null), cats: [] };
   }
 
   function normalizeSchedule(raw) {
@@ -234,6 +262,8 @@
     base.timezone = typeof raw.timezone === "string" && raw.timezone ? raw.timezone : DEFAULT_TZ;
     var w = parseInt(raw.alert_window_minutes, 10);
     base.alert_window_minutes = isNaN(w) ? 45 : w;
+    base.lead_minutes = clampInt(raw.lead_minutes, 0, 30, DEFAULT_LEAD);
+    base.alerts = normalizeAlerts(raw.alerts);
     base.cats = (Array.isArray(raw.cats) ? raw.cats : []).map(function (c) {
       return { name: String(c.name || ""), lock: String(c.lock || "22:00"), unlock: String(c.unlock || "06:30") };
     });
@@ -261,6 +291,8 @@
       enabled: !!schedule.enabled,
       timezone: schedule.timezone || DEFAULT_TZ,
       alert_window_minutes: schedule.alert_window_minutes || 45,
+      lead_minutes: schedule.lead_minutes == null ? DEFAULT_LEAD : schedule.lead_minutes,
+      alerts: normalizeAlerts(schedule.alerts),
       cats: schedule.cats.map(function (c) {
         return { name: c.name.trim(), lock: c.lock, unlock: c.unlock };
       })
@@ -278,6 +310,209 @@
     return l < u ? [{ from: l, to: u }] : [{ from: 0, to: u }, { from: l, to: 100 }];
   }
   function nowPercent(naive) { return minutesOfDay(timeOf(naive)) / 14.4; }
+
+  /* ---------- Orte, Dauer, Verlauf ---------- */
+
+  function utcToNaive(iso, tz) { return nowNaive(tz, new Date(iso)); }
+
+  function clockLabel(iso, tz) { return timeOf(utcToNaive(iso, tz)); }
+
+  function durationLabel(minutes) {
+    var m = Math.max(0, Math.round(minutes));
+    if (m < 1) return "unter 1 Min.";
+    if (m < 60) return m + " Min.";
+    var h = Math.floor(m / 60), r = m % 60;
+    if (h < 24) return r === 0 ? h + " Std." : h + " Std. " + r + " Min.";
+    var d = Math.floor(h / 24), hh = h % 24;
+    return (d === 1 ? "1 Tag" : d + " Tage") + (hh ? " " + hh + " Std." : "");
+  }
+
+  // Tageswort fuer vergangene Tage: heute / gestern / vorgestern / Wochentag / 19.10.
+  function pastDayWord(nowNv, target) {
+    var d = dayDiff(target, nowNv);
+    if (d <= 0) return "heute";
+    if (d === 1) return "gestern";
+    if (d === 2) return "vorgestern";
+    if (d < 7) return WEEKDAYS[toDate(target).getUTCDay()];
+    var t = target.slice(0, 10).split("-");
+    return t[2] + "." + t[1] + ".";
+  }
+
+  // "seit 13:49", "seit gestern 21:30", "seit Montag 08:05"
+  function sinceLabel(iso, tz, nowMs) {
+    var then = utcToNaive(iso, tz), now = nowNaive(tz, new Date(nowMs));
+    var word = pastDayWord(now, then);
+    return "seit " + (word === "heute" ? "" : word + " ") + timeOf(then);
+  }
+
+  function sortedMoves(events, name) {
+    return (events || []).filter(function (e) {
+      return e && e.k === "move" && e.cat === name && (e.dir === "in" || e.dir === "out");
+    }).sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+  }
+
+  // Zeitraeume draussen: [{from, to}] (ISO/UTC), to = null solange das Tier draussen ist.
+  // `pet` ({location, location_since}) berichtigt das Ende: ist das Tier laut Cloud drinnen, gibt es keinen offenen Zeitraum;
+  // ist es draussen, ohne dass wir den Auszug kennen, zaehlt die Cloud-Angabe "seit".
+  function excursions(events, name, pet) {
+    var list = [], open = null;
+    sortedMoves(events, name).forEach(function (m) {
+      if (m.dir === "out") open = m.t;
+      else if (open) { list.push({ from: open, to: m.t }); open = null; }
+    });
+    var loc = pet && pet.location;
+    if (loc === "inside") open = null;
+    else if (loc === "outside" && pet.location_since && (!open || open < pet.location_since)) open = pet.location_since;
+    if (open) list.push({ from: open, to: null });
+    return list;
+  }
+
+  // Minuten draussen je Kalendertag (Ortszeit); `days` Tage bis einschliesslich heute, aeltester zuerst
+  function outsideByDay(exc, tz, nowMs, days) {
+    var now = nowNaive(tz, new Date(nowMs)), today = now.slice(0, 10), sums = {};
+    exc.forEach(function (x) {
+      var a = utcToNaive(x.from, tz), b = x.to ? utcToNaive(x.to, tz) : now;
+      var cur = a, guard = 0;
+      while (cur < b && guard++ < 400) {
+        var next = addDays(cur.slice(0, 10) + "T00:00", 1);
+        var end = b < next ? b : next;
+        var key = cur.slice(0, 10);
+        sums[key] = (sums[key] || 0) + minutesBetween(cur, end);
+        cur = end;
+      }
+    });
+    var out = [];
+    for (var i = days - 1; i >= 0; i--) {
+      var d = addDays(today + "T00:00", -i).slice(0, 10);
+      out.push({ date: d, minutes: sums[d] || 0 });
+    }
+    return out;
+  }
+
+  // Heutige Aktivitaet eines Tieres: {count, minutes, hasData, perDay}
+  function activityFor(events, pet, tz, nowMs, days) {
+    var name = pet.name, now = nowNaive(tz, new Date(nowMs)), today = now.slice(0, 10);
+    var moves = sortedMoves(events, name);
+    var exc = excursions(events, name, pet);
+    var perDay = outsideByDay(exc, tz, nowMs, days || 7);
+    var count = moves.filter(function (m) { return m.dir === "out" && utcToNaive(m.t, tz).slice(0, 10) === today; }).length;
+    var todayRow = perDay[perDay.length - 1];
+    return { count: count, minutes: todayRow ? todayRow.minutes : 0, hasData: moves.length > 0, perDay: perDay,
+      firstT: moves.length ? moves[0].t : null };
+  }
+
+  function activityLine(act, name) {
+    if (!act || !act.hasData) return "";
+    if (act.count === 0 && act.minutes === 0) return "Heute noch nicht draußen.";
+    var total = durationLabel(act.minutes);
+    return act.count === 0 ? "Heute zusammen " + total + " draußen." : "Heute " + act.count + "× draußen, zusammen " + total + (/\.$/.test(total) ? "" : ".");
+  }
+
+  function eventText(e) {
+    if (e.k === "move") {
+      if (e.dir === "out") return e.cat + " ist nach draußen gegangen";
+      if (e.dir === "in") return e.cat + " ist hereingekommen";
+      return e.cat + " war an der Klappe";
+    }
+    if (e.k === "lock") {
+      var by = e.by ? " (" + e.by + ")" : "";
+      return (e.to === "locked" ? "Ausgang für " + e.cat + " gesperrt" : "Ausgang für " + e.cat + " freigegeben") + by;
+    }
+    return e.cat || "";
+  }
+
+  // Verlauf fuer die Anzeige: neueste zuerst; bei "hereingekommen" mit der Zeit, die das Tier draussen war
+  function annotateEvents(events, tz) {
+    var asc = (events || []).filter(function (e) { return e && e.t && e.k; })
+      .sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : (String(a.id) < String(b.id) ? -1 : 1); });
+    var lastOut = {}, out = [];
+    asc.forEach(function (e) {
+      var row = { e: e, id: e.id, name: e.cat, kind: e.k, dir: e.dir || null, text: eventText(e), outMin: null };
+      var local = utcToNaive(e.t, tz);
+      row.date = local.slice(0, 10); row.time = timeOf(local);
+      if (e.k === "move" && e.dir === "out") lastOut[e.cat] = e.t;
+      else if (e.k === "move" && e.dir === "in" && lastOut[e.cat]) {
+        var mins = (Date.parse(e.t) - Date.parse(lastOut[e.cat])) / 60000;
+        if (mins >= 0 && mins < 72 * 60) row.outMin = Math.round(mins);
+        delete lastOut[e.cat];
+      }
+      out.push(row);
+    });
+    return out.reverse();
+  }
+
+  function dayHeading(nowNv, date) {
+    var d = dayDiff(date + "T00:00", nowNv.slice(0, 10) + "T00:00");
+    if (d <= 0) return "Heute";
+    if (d === 1) return "Gestern";
+    var t = date.split("-");
+    return WEEKDAYS[toDate(date + "T00:00").getUTCDay()] + ", " + t[2] + "." + t[1] + ".";
+  }
+
+  /* ---------- Geraete und Warnungen ---------- */
+
+  function batteryTone(pct, warnAt) {
+    if (pct == null) return "idle";
+    if (pct <= 10) return "bad";
+    return pct <= (warnAt || 0) ? "warn" : "ok";
+  }
+  function signalLevel(db) {
+    if (typeof db !== "number") return 0;
+    return db >= -60 ? 4 : db >= -70 ? 3 : db >= -80 ? 2 : 1;
+  }
+  function signalLabel(db) {
+    return ["unbekannt", "schwach", "mittel", "gut", "sehr gut"][signalLevel(db)];
+  }
+
+  function warningText(w, tz, nowMs) {
+    if (w.kind === "outside_lock") {
+      var gilt = w.locked_since ? "Die Sperre gilt seit " + clockLabel(w.locked_since, tz) : "Die Sperre gilt";
+      return gilt + ", " + w.cat + " ist draußen " + sinceLabel(w.since, tz, nowMs) + ". Hinein kommt " + w.cat + " weiterhin.";
+    }
+    if (w.kind === "outside_long") {
+      return "Draußen " + sinceLabel(w.since, tz, nowMs) + ", das sind " +
+        durationLabel((nowMs - Date.parse(w.since)) / 60000).replace(/\.$/, "") + ". Vielleicht einmal nachsehen.";
+    }
+    if (w.kind === "battery") {
+      return "Die Batterie der Klappe „" + w.device + "“ ist bei etwa " + w.percent + " %. " +
+        (w.level === "bad" ? "Bitte bald neue Batterien einsetzen." : "Neue Batterien bereitlegen.");
+    }
+    return "";
+  }
+
+  function warningTitle(w) {
+    if (w.kind === "outside_lock") return w.cat + " ist trotz Sperre noch draußen";
+    if (w.kind === "outside_long") return w.cat + " ist lange draußen";
+    if (w.kind === "battery") return w.level === "bad" ? "Batterie fast leer" : "Batterie wird schwach";
+    return "Hinweis";
+  }
+
+  // Kurze Dauer fuer Saeulen: "35 Min.", "2,5 Std."
+  function durationShort(minutes) {
+    var m = Math.max(0, Math.round(minutes));
+    if (m === 0) return "0";
+    if (m < 60) return m + " Min.";
+    return (Math.round(m / 6) / 10).toString().replace(".", ",") + " Std.";
+  }
+
+  var ALERT_CHOICES = {
+    outside_after_lock_min: { unit: "min", values: [15, 30, 45, 60, 120] },
+    outside_long_hours: { unit: "h", values: [6, 8, 12, 18, 24] },
+    battery_percent: { unit: "%", values: [15, 20, 25, 30, 40] }
+  };
+  function choiceLabel(key, v) {
+    if (!v) return "Aus";
+    if (key === "outside_after_lock_min") return v >= 60 && v % 60 === 0 ? (v / 60 === 1 ? "1 Stunde" : (v / 60) + " Stunden") : v + " Minuten";
+    if (key === "outside_long_hours") return v === 1 ? "1 Stunde" : v + " Stunden";
+    return v + " %";
+  }
+  // Auswahl fuer eine Warn-Einstellung: [{value, label, selected}], ein ungewoehnlicher Wert bleibt erhalten
+  function alertChoices(key, current) {
+    var vals = [0].concat(ALERT_CHOICES[key].values);
+    if (vals.indexOf(current) < 0) { vals.push(current); vals.sort(function (a, b) { return a - b; }); }
+    return vals.map(function (v) { return { value: v, label: choiceLabel(key, v), selected: v === current }; });
+  }
+  function sameAlerts(a, b) { return JSON.stringify(normalizeAlerts(a)) === JSON.stringify(normalizeAlerts(b)); }
 
   /* ---------- Einrichtungs-Link ---------- */
 
@@ -331,6 +566,12 @@
     emptySchedule: emptySchedule, normalizeSchedule: normalizeSchedule,
     validateSchedule: validateSchedule, serializeSchedule: serializeSchedule, sameSchedule: sameSchedule,
     barSegments: barSegments, nowPercent: nowPercent,
+    DEFAULT_ALERTS: DEFAULT_ALERTS, DEFAULT_LEAD: DEFAULT_LEAD, normalizeAlerts: normalizeAlerts,
+    utcToNaive: utcToNaive, clockLabel: clockLabel, durationLabel: durationLabel, pastDayWord: pastDayWord,
+    sinceLabel: sinceLabel, excursions: excursions, outsideByDay: outsideByDay, activityFor: activityFor,
+    activityLine: activityLine, eventText: eventText, annotateEvents: annotateEvents, dayHeading: dayHeading,
+    batteryTone: batteryTone, signalLevel: signalLevel, signalLabel: signalLabel, warningText: warningText,
+    warningTitle: warningTitle, durationShort: durationShort, alertChoices: alertChoices, sameAlerts: sameAlerts,
     encodeSetup: encodeSetup, decodeSetup: decodeSetup, isLocalBase: isLocalBase
   };
 });
