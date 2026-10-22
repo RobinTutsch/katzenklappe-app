@@ -20,6 +20,7 @@
   var HISTORY_FILE = "history.json";
   var VAR_SCHEDULE = "SCHEDULE_JSON";
   var VAR_OVERRIDES = "OVERRIDES_JSON";
+  var VAR_LOCK = "LOCK_JSON";
 
   function ApiError(kind, status, message) {
     var e = new Error(message || kind);
@@ -178,6 +179,22 @@
     return this.setVariable(VAR_OVERRIDES, JSON.stringify(obj));
   };
 
+  // Hauptpasswort (Abdruck, siehe lock.js): null, wenn keines gesetzt ist. Ein unlesbarer Wert zaehlt als gesetzt ({v: 0}).
+  GitHub.prototype.getLock = function () {
+    return this.getVariable(VAR_LOCK).then(function (v) {
+      if (!v) return null;
+      try { var o = JSON.parse(v); return o && typeof o === "object" && !Array.isArray(o) ? o : { v: 0 }; } catch (e) { return { v: 0 }; }
+    });
+  };
+
+  GitHub.prototype.setLock = function (record) {
+    return this.setVariable(VAR_LOCK, JSON.stringify(record));
+  };
+
+  GitHub.prototype.deleteLock = function () {
+    return this.req("DELETE", "/actions/variables/" + VAR_LOCK, undefined, { allowNotFound: true }).then(function () { return true; });
+  };
+
   // Gespeicherte Zeiten: Variable, sonst schedule.json aus dem Repository, sonst null
   GitHub.prototype.getSchedule = function () {
     var self = this;
@@ -224,6 +241,6 @@
   return {
     GitHub: GitHub, ApiError: ApiError, errorText: errorText,
     WORKFLOW_FILE: WORKFLOW_FILE, STATUS_BRANCH: STATUS_BRANCH,
-    VAR_SCHEDULE: VAR_SCHEDULE, VAR_OVERRIDES: VAR_OVERRIDES
+    VAR_SCHEDULE: VAR_SCHEDULE, VAR_OVERRIDES: VAR_OVERRIDES, VAR_LOCK: VAR_LOCK
   };
 });

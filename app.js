@@ -9,7 +9,7 @@
   var HINT_KEY = "klappe.hint.install";
   var LOOKS_KEY = "klappe.looks.v1";
   var HAPTIC_KEY = "klappe.haptics";
-  var VERSION = "1.3";
+  var VERSION = "1.4";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -21,6 +21,7 @@
     loading: false, booting: false, error: null, fetchedAt: null, fromCache: false,
     looks: {}, haptics: true,
     pending: {},
+    lock: { locked: false, hiddenAt: null, verified: false },
     sheet: null,
     toast: null,
     draft: null, saved: null, scheduleLoaded: false, scheduleError: null,
@@ -132,6 +133,162 @@
     } catch (e) { return null; }
   }
 
+  /* ---------- App-Sperre (Hauptpasswort) ---------- */
+
+  function lockEnabled() { return !S.demo && !!window.KLLock && window.KLLock.has(); }
+  function wrongPw() { var e = new Error("wrongpw"); e.kind = "wrongpw"; return e; }
+
+  // Neuester Abdruck: erst von GitHub, ohne Netz die lokale Kopie. null = es gibt keinen.
+  async function currentLockRecord(api) {
+    try {
+      var remote = await api.getLock();
+      if (remote === null) { window.KLLock.clear(); return null; }
+      window.KLLock.write(remote);
+      return remote;
+    } catch (e) {
+      return window.KLLock.has() ? window.KLLock.read() : null;
+    }
+  }
+
+  // Zeigt den Sperrbildschirm. afterUnlock läuft, wenn das Passwort gestimmt hat (oder die Sperre inzwischen aufgehoben wurde).
+  function showLockScreen(cfg, afterUnlock) {
+    S.lock.locked = true;
+    var api = S.api && S.cfg === cfg ? S.api : new L.GitHub(cfg);
+    function finish() { S.lock.locked = false; S.lock.hiddenAt = null; afterUnlock(); }
+    window.KLLock.ui.showUnlock({
+      onUnlock: async function (pw) {
+        var rec = await currentLockRecord(api);
+        if (rec === null) return "released";
+        if (!(await window.KLLock.verify(rec, pw))) throw wrongPw();
+        S.lock.verified = true;
+        return "ok";
+      },
+      onDone: finish,
+      onForgot: function () { S.lock.locked = false; logout(); }
+    });
+    // Wurde die Sperre inzwischen aufgehoben, verschwindet der Bildschirm von selbst
+    currentLockRecord(api).then(function (rec) {
+      if (rec === null && S.lock.locked && window.KLLock.ui.isShowing()) { window.KLLock.ui.hideUnlock(); finish(); }
+    });
+  }
+
+  function resumeAfterLock() {
+    render(true);
+    if (S.api && (!S.fetchedAt || Date.now() - S.fetchedAt > 30000)) refresh(true);
+  }
+
+  function lockNow() {
+    if (!lockEnabled() || !S.cfg || S.lock.locked) return;
+    S.sheet = null;
+    $app.innerHTML = "";
+    showLockScreen(S.cfg, resumeAfterLock);
+  }
+
+  // Nach der Rückkehr in die App: je nach Einstellung wieder nach dem Passwort fragen
+  function maybeLock() {
+    var away = S.lock.hiddenAt == null ? null : Date.now() - S.lock.hiddenAt;
+    S.lock.hiddenAt = null;
+    if (lockEnabled() && S.cfg && !S.lock.locked && window.KLLock.shouldLock(away, window.KLLock.getAfter())) lockNow();
+  }
+
+  // Abgleich mit GitHub (bei jedem Laden). rec: null = keine Sperre, sonst der Abdruck.
+  function syncLock(rec) {
+    if (S.demo || !window.KLLock) return;
+    if (rec === null) { window.KLLock.clear(); S.lock.verified = false; return; }
+    var had = window.KLLock.has();
+    window.KLLock.write(rec);
+    if (!had && !S.lock.verified) lockNow(); // ein anderes Handy hat die Sperre neu eingeschaltet
+  }
+
+  async function lockEnable() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Hauptpasswort festlegen",
+      text: "Mindestens " + window.KLLock.MIN_LEN + " Zeichen. Das Passwort gilt für alle Handys mit diesem Zeitplan und wird nicht im Klartext gespeichert.",
+      submit: "Festlegen",
+      fields: [{ id: "new", label: "Neues Passwort", auto: "new-password" }, { id: "again", label: "Noch einmal", auto: "new-password" }],
+      validate: async function (v) {
+        var bad = window.KLLock.checkPassword(v["new"]);
+        if (bad) return bad;
+        if (v["new"] !== v.again) return "Die beiden Passwörter sind nicht gleich.";
+        try {
+          if ((await S.api.getLock()) !== null) return "Es gibt schon ein Hauptpasswort. Bitte die App neu laden.";
+          var rec = await window.KLLock.makeRecord(v["new"]);
+          await S.api.setLock(rec);
+          window.KLLock.write(rec);
+          S.lock.verified = true;
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Die App-Sperre ist an. Das Passwort gilt auf allen Handys."); }
+  }
+
+  async function lockChange() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Passwort ändern",
+      text: "Das neue Passwort gilt danach auf allen Handys. Deine Partnerin muss es von dir bekommen.",
+      submit: "Ändern",
+      fields: [{ id: "cur", label: "Aktuelles Passwort", auto: "current-password" },
+        { id: "new", label: "Neues Passwort", auto: "new-password" }, { id: "again", label: "Neues Passwort noch einmal", auto: "new-password" }],
+      validate: async function (v) {
+        try {
+          var cur = await currentLockRecord(S.api);
+          if (cur === null) return "Es gibt gar kein Passwort mehr. Bitte die App neu laden.";
+          if (!(await window.KLLock.verify(cur, v.cur))) return "Das aktuelle Passwort stimmt nicht.";
+          var bad = window.KLLock.checkPassword(v["new"]);
+          if (bad) return bad;
+          if (v["new"] !== v.again) return "Die beiden neuen Passwörter sind nicht gleich.";
+          var rec = await window.KLLock.makeRecord(v["new"]);
+          await S.api.setLock(rec);
+          window.KLLock.write(rec);
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Das Passwort wurde geändert."); }
+  }
+
+  async function lockDisable() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Sperre ausschalten",
+      text: "Danach öffnet sich die App auf allen Handys wieder ohne Passwort.",
+      submit: "Ausschalten",
+      fields: [{ id: "cur", label: "Aktuelles Passwort", auto: "current-password" }],
+      validate: async function (v) {
+        try {
+          var cur = await currentLockRecord(S.api);
+          if (cur !== null) {
+            if (!(await window.KLLock.verify(cur, v.cur))) return "Das Passwort stimmt nicht.";
+            await S.api.deleteLock();
+          }
+          window.KLLock.clear();
+          S.lock.verified = false;
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Die App-Sperre ist aus."); }
+  }
+
+  function lockHtml() {
+    if (S.demo || !window.KLLock || !window.KLLock.supported()) return "";
+    var K = window.KLLock;
+    var html = '<section class="section"><h2>App-Sperre</h2>';
+    if (!K.has()) {
+      html += "<p>Mit einem Hauptpasswort fragt die App beim Öffnen nach, bevor sie etwas zeigt oder schaltet. Das Passwort gilt für alle Handys, die mit diesem Zeitplan verbunden sind.</p>" +
+        '<div class="stack"><button class="btn" data-action="lock-enable">Hauptpasswort festlegen</button></div>';
+    } else {
+      var after = K.getAfter();
+      html += "<p>Die App fragt beim Öffnen nach dem Hauptpasswort. Es gilt für alle Handys mit diesem Zeitplan. Gib es deiner Partnerin einmal weiter.</p>" +
+        '<div class="sel-row"><label for="lock-after">Nachfragen (nur dieses Handy)</label><select class="select select-wide" id="lock-after" data-lock-after="1">' +
+        K.AFTER_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === after ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" +
+        '<div class="stack"><button class="btn" data-action="lock-now">Jetzt sperren</button>' +
+        '<button class="btn btn-quiet" data-action="lock-change">Passwort ändern</button>' +
+        '<button class="btn btn-quiet" data-action="lock-disable">Sperre ausschalten</button></div>';
+    }
+    return html + '<p class="muted small lock-note">Das ist eine Sperre für die App, kein Tresor: Wer den Einrichtungs-Link oder den Zugangsschlüssel hat, kommt auch ohne Passwort an die Daten.</p></section>';
+  }
+
   /* ---------- Verbinden ---------- */
 
   function startApp(cfg, api, demo) {
@@ -167,7 +324,18 @@
       return false;
     }
     S.setupBusy = false;
+    var lockRec;
+    try { lockRec = await api.getLock(); } catch (e) { lockRec = undefined; }
+    if (window.KLLock) {
+      window.KLLock.clear();
+      if (lockRec) window.KLLock.write(lockRec);
+    }
     saveCfg(cfg);
+    if (lockRec && window.KLLock) {
+      S.lock.verified = false;
+      showLockScreen(cfg, function () { startApp(cfg, api, false); });
+      return true;
+    }
     await startApp(cfg, api, false);
     return true;
   }
@@ -180,6 +348,8 @@
 
   function logout() {
     lsDel(CFG_KEY); lsDel(CACHE_KEY);
+    if (window.KLLock) { window.KLLock.clear(); if (window.KLLock.ui) window.KLLock.ui.hideUnlock(); }
+    S.lock.locked = false; S.lock.verified = false;
     S.cfg = null; S.api = null; S.demo = false; S.status = null; S.runs = null; S.history = null; S.pending = {};
     S.setupError = ""; S.tab = "home";
     render();
@@ -193,12 +363,14 @@
       S.api.getStatus(),
       S.api.runs().catch(function () { return null; }),
       S.api.getOverrides().catch(function () { return null; }),
-      light || !S.api.getHistory ? Promise.resolve(null) : S.api.getHistory().catch(function () { return null; })
+      light || !S.api.getHistory ? Promise.resolve(null) : S.api.getHistory().catch(function () { return null; }),
+      S.api.getLock ? S.api.getLock().then(function (r) { return { rec: r }; }, function () { return null; }) : Promise.resolve(null)
     ]);
     S.status = res[0];
     if (res[1]) S.runs = res[1];
     S.overrides = res[2];
     if (Array.isArray(res[3])) S.history = res[3];
+    if (res[4]) syncLock(res[4].rec);
     S.fetchedAt = Date.now();
     S.fromCache = false;
     cacheSave();
@@ -1006,6 +1178,7 @@
       (S.demo ? "" : '<button class="btn btn-quiet" data-action="run-now">Zeitplan jetzt ausführen</button>') + "</div>" +
       diagHtml() + "</section>";
     html += looksHtml();
+    html += lockHtml();
     if (!S.demo) {
       html += '<section class="section"><h2>Zweite Person einladen</h2>' +
         "<p>Der Link richtet die App auf einem anderen Handy ein, ohne dass dort etwas getippt werden muss. Er enthält den Zugangsschlüssel: nur an Personen schicken, denen du vertraust.</p>" +
@@ -1121,6 +1294,7 @@
   }
 
   function render(force) {
+    if (S.lock.locked) return; // hinter der Sperre wird nichts gezeichnet
     var ae = document.activeElement;
     if (!force && S.tab === "times" && ae && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && S.draft && !S.sheet) {
       updateScheduleUi();
@@ -1580,6 +1754,10 @@
       case "remove-cat": askRemove(+el.dataset.idx); break;
       case "save-times": saveTimes(); break;
       case "diag": runDiag(); break;
+      case "lock-enable": lockEnable(); break;
+      case "lock-change": lockChange(); break;
+      case "lock-disable": lockDisable(); break;
+      case "lock-now": lockNow(); break;
       case "share": share(); break;
       case "copy-link": copyLink(); break;
       case "install":
@@ -1637,6 +1815,10 @@
       if (tm) tm.focus();
       return;
     }
+    if (t.dataset && t.dataset.lockAfter) {
+      if (window.KLLock) window.KLLock.setAfter(parseInt(t.value, 10) || 0);
+      return;
+    }
     if (t.dataset && t.dataset.haptics) {
       S.haptics = !!t.checked;
       lsSet(HAPTIC_KEY, S.haptics ? "1" : "0");
@@ -1679,6 +1861,8 @@
   window.addEventListener("beforeinstallprompt", function (ev) { ev.preventDefault(); S.installEvt = ev; render(); });
   window.addEventListener("appinstalled", function () { S.installEvt = null; lsSet(HINT_KEY, "1"); render(); });
   document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { S.lock.hiddenAt = Date.now(); return; }
+    maybeLock();
     if (!document.hidden && window.KLTheme) window.KLTheme.apply();
     if (!document.hidden && S.api && (!S.fetchedAt || Date.now() - S.fetchedAt > 30000)) refresh(true);
   });
@@ -1742,7 +1926,12 @@
   async function boot() {
     if (await handleHash()) return;
     var stored = loadCfg();
-    if (stored) { await startApp(stored, new L.GitHub(stored), false); applyShortcut(); return; }
+    if (stored) {
+      var go = async function () { await startApp(stored, new L.GitHub(stored), false); applyShortcut(); };
+      if (window.KLLock && window.KLLock.has()) { showLockScreen(stored, go); return; }
+      await go();
+      return;
+    }
     render();
   }
 

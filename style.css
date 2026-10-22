@@ -559,3 +559,32 @@ html, body { overflow-x: clip; }
 .swatch { min-height: 0; min-width: 0; width: 100%; }
 .wp-axis { display: grid; grid-template-columns: 44px 1fr; gap: 8px; }
 .wp-axis .bar-ticks { margin: 0 2px; }
+
+/* ---------- App-Sperre ---------- */
+body.lk-open { overflow: hidden; }
+.lk {
+  position: fixed; inset: 0; z-index: 60; overflow-y: auto; display: flex; justify-content: center; align-items: flex-start;
+  padding: calc(34px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));
+  background-color: var(--bg); background-image: radial-gradient(var(--dots) 2px, transparent 2.5px); background-size: 22px 22px;
+  animation: fade .2s ease-out;
+}
+.lk-card {
+  width: 100%; max-width: 420px; display: grid; gap: 12px; padding: 22px 18px 20px; text-align: center;
+  background: var(--card); color: var(--ink); border: 3px solid var(--ink); border-radius: 30px; box-shadow: 6px 6px 0 var(--shadow);
+}
+.lk-face { display: block; width: 96px; height: 96px; margin: 0 auto 2px; }
+.lk-face .face-svg { width: 100%; height: 100%; display: block; }
+.lk-card h1 { font-size: 34px; line-height: 1.05; font-weight: 700; letter-spacing: -0.01em; }
+.lk-sub { color: var(--ink-2); font-weight: 450; font-size: 16px; text-align: left; }
+.lk-card .lk-center { text-align: center; }
+.lk-card .input { text-align: center; }
+.lk-err {
+  margin: 0; color: var(--bad-ink); background: var(--bad-bg); border: 3px solid var(--ink); border-radius: 18px;
+  padding: 10px 14px; font-weight: 500; font-size: 16px; text-align: left;
+}
+.lk-err[hidden] { display: none; }
+.lk-scrim { z-index: 70; align-items: center; padding: 16px; }
+.lk-sheet { border-radius: 30px; border-bottom: 3px solid var(--ink); max-height: 92dvh; padding-bottom: 18px; }
+.lk-show { display: flex; align-items: center; gap: 10px; margin: 14px 2px 4px; font-size: 16px; font-weight: 500; color: var(--ink-2); }
+.lk-show input { width: 22px; height: 22px; margin: 0; accent-color: var(--ink); }
+.lk-note { margin-top: 12px; font-size: 14px; }
