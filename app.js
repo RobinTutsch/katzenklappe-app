@@ -9,7 +9,7 @@
   var HINT_KEY = "klappe.hint.install";
   var LOOKS_KEY = "klappe.looks.v1";
   var HAPTIC_KEY = "klappe.haptics";
-  var VERSION = "1.5";
+  var VERSION = "1.6";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -696,7 +696,37 @@
     return '<div class="gauge" data-tone="' + tone + '">' +
       '<div class="gauge-row"><span>Batterie</span><strong>' + (pct == null ? "unbekannt" : pct + " %") + "</strong></div>" +
       (pct == null ? "" : '<div class="gauge-track" role="img" aria-label="Batterie ' + pct + ' Prozent"><span style="width:' + pct + '%"></span></div>') +
-      '<p class="gauge-sub">' + esc(volts + "Die Prozentzahl ist aus der Spannung geschätzt.") + "</p></div>";
+      '<p class="gauge-sub">' + esc(volts + "Die Prozentzahl ist aus der Spannung geschätzt.") + "</p>" + batteryTrendHtml(d) + "</div>";
+  }
+
+  function batteryTrendHtml(d) {
+    var log = d.battery_log;
+    if (!Array.isArray(log)) return "";
+    var now = Date.now();
+    var pts = L.batterySamples(log, now).filter(function (s) { return s.ms >= now - 60 * 86400000; });
+    var o = L.batteryOutlook(log, now);
+    var html = '<div class="trend"><p class="form-label">Verlauf der Spannung</p>';
+    if (pts.length >= 2) {
+      var W = 300, H = 72, pad = 8;
+      var vmin = Math.min.apply(null, pts.map(function (s) { return s.v; })), vmax = Math.max.apply(null, pts.map(function (s) { return s.v; }));
+      // Die "leer"-Linie nur zeichnen, wenn sie nah genug ist; sonst wuerde die Kurve flach gedrueckt
+      var showEmpty = vmin - L.BATTERY_EMPTY_V < 0.35;
+      var lo = (showEmpty ? Math.min(vmin, L.BATTERY_EMPTY_V) : vmin) - 0.05, hi = Math.max(vmax, lo + 0.3) + 0.05;
+      var t0 = pts[0].ms, t1 = Math.max(pts[pts.length - 1].ms, t0 + 86400000);
+      var xy = pts.map(function (s) {
+        return [pad + (s.ms - t0) / (t1 - t0) * (W - 2 * pad), H - pad - (s.v - lo) / (hi - lo) * (H - 2 * pad)];
+      });
+      var yEmpty = H - pad - (L.BATTERY_EMPTY_V - lo) / (hi - lo) * (H - 2 * pad);
+      var last = xy[xy.length - 1];
+      html += '<svg class="spark" viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="Spannung der Batterie in den letzten Wochen: von ' +
+        String(pts[0].v).replace(".", ",") + " auf " + String(pts[pts.length - 1].v).replace(".", ",") + ' Volt">' +
+        (showEmpty ? '<line class="spark-empty" x1="' + pad + '" x2="' + (W - pad) + '" y1="' + yEmpty.toFixed(1) + '" y2="' + yEmpty.toFixed(1) + '"/>' +
+          '<text class="spark-note" x="' + pad + '" y="' + (yEmpty - 5).toFixed(1) + '">leer</text>' : "") +
+        '<polyline class="spark-line" points="' + xy.map(function (q) { return q[0].toFixed(1) + "," + q[1].toFixed(1); }).join(" ") + '"/>' +
+        '<circle class="spark-dot" cx="' + last[0].toFixed(1) + '" cy="' + last[1].toFixed(1) + '" r="5"/></svg>' +
+        '<div class="spark-axis"><span>' + esc("vor " + Math.max(1, Math.round((now - t0) / 86400000)) + " Tagen") + "</span><span>heute</span></div>";
+    }
+    return html + '<p class="gauge-sub">' + esc(L.batteryOutlookText(o)) + "</p></div>";
   }
 
   function signalHtml(db) {
@@ -1154,10 +1184,20 @@
         return '<li><button class="pal-btn" data-action="palette" data-id="' + p.id + '" aria-pressed="' + (p.id === curPal) + '" aria-label="Farbschema ' + esc(p.name) + '">' +
           '<span class="pal-sw" style="--d:' + p.day + ';--n:' + p.night + '"></span><span>' + esc(p.name) + "</span></button></li>";
       }).join("") + "</ul>" : "";
+    var curStyle = window.KLTheme && window.KLTheme.getStyle ? window.KLTheme.getStyle() : "cartoon";
+    var curMotion = window.KLTheme && window.KLTheme.getMotion ? window.KLTheme.getMotion() : "auto";
+    var styleHtml = window.KLTheme && window.KLTheme.STYLES ? '<p class="form-label" id="style-label">Stil</p><ul class="pal-grid pal-grid-2" role="group" aria-labelledby="style-label">' +
+      [["cartoon", "Cartoon", "Dicke Konturen"], ["modern", "Modern", "Weich und ruhig"]].map(function (s) {
+        return '<li><button class="pal-btn style-btn" data-action="style" data-id="' + s[0] + '" aria-pressed="' + (s[0] === curStyle) + '" aria-label="Stil ' + s[1] + '">' +
+          '<span class="style-prev" data-style-prev="' + s[0] + '" aria-hidden="true"></span><strong>' + s[1] + "</strong><small>" + s[2] + "</small></button></li>";
+      }).join("") + "</ul>" : "";
+    var motionHtml = window.KLTheme && window.KLTheme.MOTIONS ? '<div class="sel-row"><label for="motion-mode">Animationen</label><select class="select select-wide" id="motion-mode" data-motion-mode="1">' +
+      [["auto", "Wie das Handy"], ["on", "Immer an"], ["off", "Aus"]].map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === curMotion ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") +
+      '</select></div><p class="gauge-sub">Blinzelnde Augen, schlafende Katzen und laufende Pfoten. „Wie das Handy“ schaltet sie aus, wenn am Handy „Animationen reduzieren“ an ist.</p>' : "";
     var html = '<section class="section"><h2>Aussehen</h2>' +
       "<p>Automatisch heißt: hell am Tag, dunkel in der Nacht (nach Sonnenauf- und -untergang, wenn unter „Zeiten“ ein Standort eingestellt ist). Alles hier gilt nur für dieses Handy.</p>" +
       '<div class="sel-row"><label for="theme-mode">Farbwelt</label><select class="select select-wide" id="theme-mode" data-theme-mode="1">' +
-      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" + palHtml;
+      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" + palHtml + styleHtml + motionHtml;
     if (names.length) {
       html += '<p class="form-label">Fellfarben</p><ul class="look-list">' + names.map(function (n) {
         var lk = lookOf(n);
@@ -1762,6 +1802,9 @@
       case "palette":
         if (window.KLTheme && window.KLTheme.setPalette) { window.KLTheme.setPalette(el.dataset.id); render(true); var pb = $app.querySelector('.pal-btn[aria-pressed="true"]'); if (pb) pb.focus(); }
         break;
+      case "style":
+        if (window.KLTheme && window.KLTheme.setStyle) { window.KLTheme.setStyle(el.dataset.id); render(true); var sb = $app.querySelector('.style-btn[aria-pressed="true"]'); if (sb) sb.focus(); }
+        break;
       case "diag": runDiag(); break;
       case "lock-enable": lockEnable(); break;
       case "lock-change": lockChange(); break;
@@ -1822,6 +1865,13 @@
       render(true);
       var tm = document.getElementById("theme-mode");
       if (tm) tm.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.motionMode) {
+      if (window.KLTheme && window.KLTheme.setMotion) window.KLTheme.setMotion(t.value);
+      render(true);
+      var mm = document.getElementById("motion-mode");
+      if (mm) mm.focus();
       return;
     }
     if (t.dataset && t.dataset.lockAfter) {

@@ -16,6 +16,10 @@
   var SUN_KEY = "klappe.sun";
   var MODES = ["auto", "system", "day", "night"];
   var PAL_KEY = "klappe.palette";
+  var STYLE_KEY = "klappe.style";
+  var MOTION_KEY = "klappe.motion";
+  var STYLES = ["cartoon", "modern"];
+  var MOTIONS = ["auto", "on", "off"];
   var PALETTES = [
     { id: "sonne", name: "Sonnengelb", day: "#FFD84A", night: "#2A2565" },
     { id: "rosa", name: "Rosa", day: "#FF9EC4", night: "#4A1D4F" },
@@ -62,11 +66,11 @@
     }
   }
 
-  var api = { resolve: resolve, clock: clock, MODES: MODES, PALETTES: PALETTES, palette: palette, toMin: toMin };
+  var api = { resolve: resolve, clock: clock, MODES: MODES, PALETTES: PALETTES, palette: palette, toMin: toMin, STYLES: STYLES, MOTIONS: MOTIONS };
 
   var doc = root && root.document;
   if (doc && doc.documentElement) {
-    var state = { mode: "auto", pal: "sonne", sun: null, tz: DEFAULT_TZ, theme: "day" };
+    var state = { mode: "auto", pal: "sonne", style: "cartoon", motion: "auto", sun: null, tz: DEFAULT_TZ, theme: "day" };
     var store = {
       get: function (k) { try { return root.localStorage.getItem(k); } catch (e) { return null; } },
       set: function (k, v) { try { root.localStorage.setItem(k, v); } catch (e) { /* egal */ } }
@@ -75,12 +79,26 @@
     if (MODES.indexOf(saved) >= 0) state.mode = saved;
     var savedPal = store.get(PAL_KEY);
     if (savedPal && palette(savedPal).id === savedPal) state.pal = savedPal;
+    var savedStyle = store.get(STYLE_KEY);
+    if (STYLES.indexOf(savedStyle) >= 0) state.style = savedStyle;
+    var savedMotion = store.get(MOTION_KEY);
+    if (MOTIONS.indexOf(savedMotion) >= 0) state.motion = savedMotion;
     try { state.sun = JSON.parse(store.get(SUN_KEY) || "null"); } catch (e) { state.sun = null; }
 
     api.getMode = function () { return state.mode; };
     api.getPalette = function () { return state.pal; };
     api.setPalette = function (id) {
       state.pal = palette(id).id; store.set(PAL_KEY, state.pal);
+      return api.apply();
+    };
+    api.getStyle = function () { return state.style; };
+    api.setStyle = function (s) {
+      state.style = STYLES.indexOf(s) >= 0 ? s : "cartoon"; store.set(STYLE_KEY, state.style);
+      return api.apply();
+    };
+    api.getMotion = function () { return state.motion; };
+    api.setMotion = function (m) {
+      state.motion = MOTIONS.indexOf(m) >= 0 ? m : "auto"; store.set(MOTION_KEY, state.motion);
       return api.apply();
     };
     api.current = function () { return state.theme; };
@@ -104,6 +122,8 @@
       state.theme = theme;
       doc.documentElement.setAttribute("data-theme", theme);
       doc.documentElement.setAttribute("data-palette", state.pal);
+      doc.documentElement.setAttribute("data-style", state.style);
+      doc.documentElement.setAttribute("data-motion", state.motion);
       var meta = doc.querySelector ? doc.querySelector('meta[name="theme-color"]') : null;
       if (meta) meta.setAttribute("content", palette(state.pal)[theme]);
       return theme;

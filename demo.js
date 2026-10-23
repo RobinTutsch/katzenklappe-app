@@ -13,6 +13,12 @@
 })(typeof self !== "undefined" ? self : this, function (L) {
   "use strict";
 
+  function demoBatteryLog() {
+    var out = [], now = Date.now();
+    for (var i = 20; i >= 0; i--) out.push([new Date(now - i * 86400000).toISOString().replace(/\.\d+Z$/, "Z"), Math.round((5.85 - (20 - i) * 0.012) * 100) / 100]);
+    return out;
+  }
+
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
   function iso(ms) { return new Date(ms).toISOString().replace(/\.\d+Z$/, "Z"); }
 
@@ -58,21 +64,24 @@
       var id = 1, ev = [];
       // heute nur, was vor der aktuellen Lage der Tiere liegt (damit Aus- und Eintritte zusammenpassen)
       var before = { Tom: startMs - 100 * 60000, Mimo: startMs - 6 * 3600000 - 60000, Luna: startMs - 100 * 60000 };
-      function add(back, hh, mm, cat, dir) {
-        var t = pastIso(back, hh, mm);
-        if (back > 0 || Date.parse(t) < before[cat]) ev.push({ id: "d" + (id++), t: t, k: "move", cat: cat, dir: dir });
+      // Aus und Ein immer als Paar: heute nur, wenn beides vor der aktuellen Lage liegt (sonst blieben einzelne Aus-Eintraege stehen)
+      function addPair(back, h1, m1, h2, m2, cat) {
+        var t1 = pastIso(back, h1, m1), t2 = pastIso(back, h2, m2);
+        if (back > 0 || Date.parse(t2) < before[cat]) {
+          ev.push({ id: "d" + (id++), t: t1, k: "move", cat: cat, dir: "out" });
+          ev.push({ id: "d" + (id++), t: t2, k: "move", cat: cat, dir: "in" });
+        }
       }
       var tom = [[7, 10, 8, 40], [12, 5, 13, 20], [17, 30, 18, 15], [20, 50, 21, 40]];
       for (var back = 6; back >= 0; back--) {
         var rows = back % 2 === 0 ? tom : tom.slice(0, 3);
         rows.forEach(function (r, i) {
-          add(back, r[0], r[1], "Tom", "out");
-          add(back, r[2], r[3], "Tom", "in");
+          addPair(back, r[0], r[1], r[2], r[3], "Tom");
         });
-        add(back, 6, 45, "Mimo", "out"); add(back, 9, 5, "Mimo", "in");
-        add(back, 15, 30, "Mimo", "out"); add(back, 16, 10, "Mimo", "in");
-        add(back, 22, 40, "Mimo", "out"); add(back, 23, 20, "Mimo", "in");
-        if (back % 3 === 0) { add(back, 19, 10, "Luna", "out"); add(back, 20, 5, "Luna", "in"); }
+        addPair(back, 6, 45, 9, 5, "Mimo");
+        addPair(back, 15, 30, 16, 10, "Mimo");
+        addPair(back, 22, 40, 23, 20, "Mimo");
+        if (back % 3 === 0) addPair(back, 19, 10, 20, 5, "Luna");
         ev.push({ id: "dl" + back, t: pastIso(back, 22, 0), k: "lock", cat: "Tom", to: "locked", by: "Zeitplan" });
         ev.push({ id: "dm" + back, t: pastIso(back, 6, 30), k: "lock", cat: "Tom", to: "free", by: "Zeitplan" });
       }
@@ -159,7 +168,7 @@
         sun: sunToday(naive),
         vacations: L.pruneVacations(schedule.vacations, naive).map(function (v) { return clone(v); }),
         devices: [
-          { id: 1, kind: "flap", name: "Haustür", online: true, battery_v: 5.7, battery_pct: battery, signal_db: -65, hub_signal_db: -55 },
+          { id: 1, kind: "flap", name: "Haustür", online: true, battery_v: 5.7, battery_pct: battery, signal_db: -65, hub_signal_db: -55, battery_log: demoBatteryLog() },
           { id: 2, kind: "hub", name: "Wohnzimmer", online: true }
         ],
         pets: Object.keys(places).sort().map(function (n) {

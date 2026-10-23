@@ -848,6 +848,51 @@
     if (pct <= 10) return "bad";
     return pct <= (warnAt || 0) ? "warn" : "ok";
   }
+  /* Batterie-Verlauf: Messwerte [Zeitpunkt, Volt] (ein Wert pro Tag). Die Prognose ist eine grobe Gerade
+   * durch die letzten Wochen; zum Ende fallen die Zellen schneller ab, deshalb nur "ungefaehr". */
+  var BATTERY_EMPTY_V = 5.0;   // 4 Zellen, je 1,25 V = leer (wie bei der Prozentschaetzung)
+  function batterySamples(log, nowMs) {
+    var out = [];
+    (Array.isArray(log) ? log : []).forEach(function (e) {
+      if (!Array.isArray(e) || typeof e[1] !== "number" || !isFinite(e[1]) || e[1] <= 0) return;
+      var ms = Date.parse(e[0]);
+      if (!isFinite(ms) || (nowMs != null && ms > nowMs + 3600000)) return;
+      out.push({ ms: ms, v: e[1] });
+    });
+    out.sort(function (a, b) { return a.ms - b.ms; });
+    return out;
+  }
+  function batteryOutlook(log, nowMs) {
+    var DAY = 86400000;
+    var all = batterySamples(log, nowMs);
+    var recent = all.filter(function (s) { return nowMs == null || s.ms >= nowMs - 45 * DAY; });
+    if (recent.length < 6 || (recent[recent.length - 1].ms - recent[0].ms) < 6 * DAY) {
+      return { state: "collecting", count: all.length };
+    }
+    var t0 = recent[0].ms, n = recent.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    recent.forEach(function (s) { var x = (s.ms - t0) / DAY; sx += x; sy += s.v; sxx += x * x; sxy += x * s.v; });
+    var den = n * sxx - sx * sx;
+    if (den <= 0) return { state: "collecting", count: all.length };
+    var slope = (n * sxy - sx * sy) / den;              // Volt pro Tag
+    var icpt = (sy - slope * sx) / n;
+    var xLast = (recent[n - 1].ms - t0) / DAY;
+    var nowFit = icpt + slope * xLast;
+    if (slope > -0.002) return { state: "stable", slope: slope };
+    if (nowFit <= BATTERY_EMPTY_V) return { state: "trend", days: 0, slope: slope };
+    var days = (nowFit - BATTERY_EMPTY_V) / -slope;
+    return { state: "trend", days: Math.round(days), slope: slope };
+  }
+  function batteryOutlookText(o) {
+    if (!o) return "";
+    if (o.state === "collecting") return "Die App sammelt noch Messwerte (einer pro Tag). Nach etwa einer Woche gibt es eine grobe Schätzung.";
+    if (o.state === "stable") return "Die Spannung sinkt zurzeit kaum.";
+    var d = o.days;
+    if (d <= 0) return "Bald wechseln: Nach dem bisherigen Verlauf ist die Batterie fast leer.";
+    if (d > 540) return "Nach dem bisherigen Verlauf halten die Batterien noch sehr lange.";
+    var span = d < 14 ? d + (d === 1 ? " Tag" : " Tage") : d < 70 ? Math.round(d / 7) + " Wochen" : Math.round(d / 30) + " Monate";
+    return "Bei gleichem Tempo halten die Batterien ungefähr noch " + span + ". Das ist grob geschätzt, gegen Ende sinkt die Spannung schneller.";
+  }
+
   function signalLevel(db) {
     if (typeof db !== "number") return 0;
     return db >= -60 ? 4 : db >= -70 ? 3 : db >= -80 ? 2 : 1;
@@ -962,7 +1007,7 @@
     utcToNaive: utcToNaive, clockLabel: clockLabel, durationLabel: durationLabel, pastDayWord: pastDayWord,
     sinceLabel: sinceLabel, excursions: excursions, outsideByDay: outsideByDay, activityFor: activityFor,
     activityLine: activityLine, eventText: eventText, annotateEvents: annotateEvents, dayHeading: dayHeading,
-    batteryTone: batteryTone, signalLevel: signalLevel, signalLabel: signalLabel, warningText: warningText,
+    batteryTone: batteryTone, batterySamples: batterySamples, batteryOutlook: batteryOutlook, batteryOutlookText: batteryOutlookText, BATTERY_EMPTY_V: BATTERY_EMPTY_V, signalLevel: signalLevel, signalLabel: signalLabel, warningText: warningText,
     warningTitle: warningTitle, durationShort: durationShort, alertChoices: alertChoices, sameAlerts: sameAlerts,
     encodeSetup: encodeSetup, decodeSetup: decodeSetup, isLocalBase: isLocalBase,
     parseWhen: parseWhen, whenText: whenText, canonWhen: canonWhen, isWhen: isWhen, whenKind: whenKind,
