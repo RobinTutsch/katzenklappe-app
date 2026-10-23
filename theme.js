@@ -15,7 +15,19 @@
   var KEY = "klappe.theme";
   var SUN_KEY = "klappe.sun";
   var MODES = ["auto", "system", "day", "night"];
-  var COLORS = { day: "#FFD84A", night: "#2A2565" };
+  var PAL_KEY = "klappe.palette";
+  var PALETTES = [
+    { id: "sonne", name: "Sonnengelb", day: "#FFD84A", night: "#2A2565" },
+    { id: "rosa", name: "Rosa", day: "#FF9EC4", night: "#4A1D4F" },
+    { id: "flieder", name: "Flieder", day: "#C9A8FF", night: "#2B1F5C" },
+    { id: "mint", name: "Mint", day: "#8FDDB8", night: "#12383A" },
+    { id: "himmel", name: "Himmelblau", day: "#8CD3F5", night: "#14284F" },
+    { id: "pfirsich", name: "Pfirsich", day: "#FFB38A", night: "#4A2330" }
+  ];
+  function palette(id) {
+    for (var i = 0; i < PALETTES.length; i++) if (PALETTES[i].id === id) return PALETTES[i];
+    return PALETTES[0];
+  }
   var DEFAULT_TZ = "Europe/Berlin";
 
   function toMin(hhmm) {
@@ -50,20 +62,27 @@
     }
   }
 
-  var api = { resolve: resolve, clock: clock, MODES: MODES, COLORS: COLORS, toMin: toMin };
+  var api = { resolve: resolve, clock: clock, MODES: MODES, PALETTES: PALETTES, palette: palette, toMin: toMin };
 
   var doc = root && root.document;
   if (doc && doc.documentElement) {
-    var state = { mode: "auto", sun: null, tz: DEFAULT_TZ, theme: "day" };
+    var state = { mode: "auto", pal: "sonne", sun: null, tz: DEFAULT_TZ, theme: "day" };
     var store = {
       get: function (k) { try { return root.localStorage.getItem(k); } catch (e) { return null; } },
       set: function (k, v) { try { root.localStorage.setItem(k, v); } catch (e) { /* egal */ } }
     };
     var saved = store.get(KEY);
     if (MODES.indexOf(saved) >= 0) state.mode = saved;
+    var savedPal = store.get(PAL_KEY);
+    if (savedPal && palette(savedPal).id === savedPal) state.pal = savedPal;
     try { state.sun = JSON.parse(store.get(SUN_KEY) || "null"); } catch (e) { state.sun = null; }
 
     api.getMode = function () { return state.mode; };
+    api.getPalette = function () { return state.pal; };
+    api.setPalette = function (id) {
+      state.pal = palette(id).id; store.set(PAL_KEY, state.pal);
+      return api.apply();
+    };
     api.current = function () { return state.theme; };
     api.setMode = function (m) {
       if (MODES.indexOf(m) < 0) return state.theme;
@@ -84,8 +103,9 @@
       var theme = resolve(state.mode, c.min, state.sun, dark, c.date);
       state.theme = theme;
       doc.documentElement.setAttribute("data-theme", theme);
+      doc.documentElement.setAttribute("data-palette", state.pal);
       var meta = doc.querySelector ? doc.querySelector('meta[name="theme-color"]') : null;
-      if (meta) meta.setAttribute("content", COLORS[theme]);
+      if (meta) meta.setAttribute("content", palette(state.pal)[theme]);
       return theme;
     };
     api.apply();

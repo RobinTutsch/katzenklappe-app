@@ -9,7 +9,7 @@
   var HINT_KEY = "klappe.hint.install";
   var LOOKS_KEY = "klappe.looks.v1";
   var HAPTIC_KEY = "klappe.haptics";
-  var VERSION = "1.4";
+  var VERSION = "1.5";
   var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
   var POLL_MS = 4000;
   var WAIT_MAX_MS = 240000;
@@ -1148,10 +1148,16 @@
   function looksHtml() {
     var mode = window.KLTheme && window.KLTheme.getMode ? window.KLTheme.getMode() : "auto";
     var names = allPetNames().sort(function (a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1; });
+    var curPal = window.KLTheme && window.KLTheme.getPalette ? window.KLTheme.getPalette() : "sonne";
+    var palHtml = window.KLTheme && window.KLTheme.PALETTES ? '<p class="form-label" id="pal-label">Farbschema</p><ul class="pal-grid" role="group" aria-labelledby="pal-label">' +
+      window.KLTheme.PALETTES.map(function (p) {
+        return '<li><button class="pal-btn" data-action="palette" data-id="' + p.id + '" aria-pressed="' + (p.id === curPal) + '" aria-label="Farbschema ' + esc(p.name) + '">' +
+          '<span class="pal-sw" style="--d:' + p.day + ';--n:' + p.night + '"></span><span>' + esc(p.name) + "</span></button></li>";
+      }).join("") + "</ul>" : "";
     var html = '<section class="section"><h2>Aussehen</h2>' +
-      "<p>Automatisch heißt: gelb am Tag, violett in der Nacht (nach Sonnenauf- und -untergang, wenn unter „Zeiten“ ein Standort eingestellt ist). Alles hier gilt nur für dieses Handy.</p>" +
+      "<p>Automatisch heißt: hell am Tag, dunkel in der Nacht (nach Sonnenauf- und -untergang, wenn unter „Zeiten“ ein Standort eingestellt ist). Alles hier gilt nur für dieses Handy.</p>" +
       '<div class="sel-row"><label for="theme-mode">Farbwelt</label><select class="select select-wide" id="theme-mode" data-theme-mode="1">' +
-      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>";
+      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" + palHtml;
     if (names.length) {
       html += '<p class="form-label">Fellfarben</p><ul class="look-list">' + names.map(function (n) {
         var lk = lookOf(n);
@@ -1753,6 +1759,9 @@
       case "geolocate": useGps(); break;
       case "remove-cat": askRemove(+el.dataset.idx); break;
       case "save-times": saveTimes(); break;
+      case "palette":
+        if (window.KLTheme && window.KLTheme.setPalette) { window.KLTheme.setPalette(el.dataset.id); render(true); var pb = $app.querySelector('.pal-btn[aria-pressed="true"]'); if (pb) pb.focus(); }
+        break;
       case "diag": runDiag(); break;
       case "lock-enable": lockEnable(); break;
       case "lock-change": lockChange(); break;
