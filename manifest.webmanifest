@@ -1,17 +1,73 @@
 {
-  "name": "Kalender",
-  "short_name": "Kalender",
-  "description": "Schichtplan, Geburtstage und eigene Termine",
+  "name": "Katzenklappe",
+  "short_name": "Klappe",
+  "description": "Zeitplan pro Tier für die Sure-Petcare-Katzenklappe",
   "lang": "de",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#FAFAF7",
-  "theme_color": "#FAFAF7",
+  "background_color": "#FFD84A",
+  "theme_color": "#FFD84A",
   "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Alle drinnen lassen",
+      "short_name": "Drinnen",
+      "description": "Alle Tiere für eine Weile drinnen lassen",
+      "url": "./#lockall",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Alle rauslassen",
+      "short_name": "Rauslassen",
+      "description": "Alle Tiere für eine Weile rauslassen",
+      "url": "./#freeall",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Verlauf",
+      "short_name": "Verlauf",
+      "description": "Wer war wann draußen",
+      "url": "./#history",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    }
   ]
 }

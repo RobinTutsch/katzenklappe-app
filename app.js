@@ -1,541 +1,2007 @@
-/* Kalender - Oberflaeche. Alle Daten bleiben auf diesem Handy (localStorage), nichts geht ins Netz. */
+/* Katzenklappe - Oberfläche */
 (function () {
   "use strict";
-  var L = window.KalLogic, T = window.KalTheme;
-  var VERSION = "1.0";
-  var DATA_KEY = "kal.data.v1";
+
+  var L = window.KL;
   var $app = document.getElementById("app");
-  var $toast = document.getElementById("toast");
+  var CFG_KEY = "klappe.cfg.v1";
+  var CACHE_KEY = "klappe.cache.v1";
+  var HINT_KEY = "klappe.hint.install";
+  var LOOKS_KEY = "klappe.looks.v1";
+  var HAPTIC_KEY = "klappe.haptics";
+  var VERSION = "1.6";
+  var STALE_MINUTES = 100;      // so lange darf der letzte Lauf zurückliegen
+  var POLL_MS = 4000;
+  var WAIT_MAX_MS = 240000;
 
-  /* ---------- Zustand ---------- */
-  var S = { tab: "month", y: 0, m: 0, year: 0, sel: "", today: "", data: L.emptyData(), storageOk: true, loadNote: "", sheetOpen: false, lastFocus: null, confirmCb: null, importItems: null };
-
-  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
-  function $(sel, root) { return (root || document).querySelector(sel); }
-
-  function load() {
-    var raw = null;
-    try { raw = window.localStorage.getItem(DATA_KEY); } catch (e) { S.storageOk = false; }
-    if (raw) {
-      try { S.data = L.normalizeData(JSON.parse(raw)); }
-      catch (e) {
-        try { window.localStorage.setItem(DATA_KEY + ".defekt", raw); } catch (e2) { /* egal */ }
-        S.loadNote = "Die gespeicherten Daten waren nicht lesbar. Sie wurden zur Sicherheit beiseitegelegt, der Kalender startet neu.";
-        S.data = L.emptyData();
-      }
-    }
-  }
-  function save() {
-    try { window.localStorage.setItem(DATA_KEY, JSON.stringify(S.data)); S.storageOk = true; }
-    catch (e) { S.storageOk = false; toast("Speichern am Handy hat nicht geklappt."); }
-  }
-  var toastTimer = 0;
-  function toast(text) {
-    $toast.textContent = text; $toast.hidden = false;
-    clearTimeout(toastTimer); toastTimer = setTimeout(function () { $toast.hidden = true; }, 3200);
-  }
+  var S = {
+    cfg: null, api: null, demo: false,
+    tab: "home",
+    status: null, runs: null, overrides: null, history: null, histFilter: null, histShown: 30,
+    loading: false, booting: false, error: null, fetchedAt: null, fromCache: false,
+    looks: {}, haptics: true,
+    pending: {},
+    lock: { locked: false, hiddenAt: null, verified: false },
+    sheet: null,
+    toast: null,
+    draft: null, saved: null, scheduleLoaded: false, scheduleError: null,
+    vacForm: null, vacError: "", shortcut: null,
+    diag: null, diagBusy: false,
+    installEvt: null, setupError: "", setupBusy: false,
+    online: navigator.onLine !== false
+  };
 
   /* ---------- Hilfen ---------- */
-  var I = {
-    left: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>',
-    right: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>',
-    plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-    month: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>',
-    year: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.5"/><rect x="14" y="4" width="6" height="6" rx="1.5"/><rect x="4" y="14" width="6" height="6" rx="1.5"/><rect x="14" y="14" width="6" height="6" rx="1.5"/></svg>',
-    list: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>',
-    more: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18" cy="12" r="1.4"/></svg>'
-  };
-  var CHIP = { frueh: "F", spaet: "S", frei: "frei", urlaub: "U" };
-  var SHIFT_NAMES = L.SHIFT_TYPES;
 
-  function monthName(m) { return L.MONTHS[m - 1]; }
-  function firstOfMonth(y, m) { return L.ymd(y, m, 1); }
-  function selectDefault() { S.sel = (S.today.slice(0, 7) === S.y + "-" + L.pad(S.m)) ? S.today : firstOfMonth(S.y, S.m); }
-  function goMonth(delta) {
-    var idx = S.y * 12 + (S.m - 1) + delta;
-    S.y = Math.floor(idx / 12); S.m = idx - S.y * 12 + 1;
-    selectDefault();
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
   }
-  function shiftTimes(sh) { return sh && sh.start ? sh.start + " – " + sh.end + " Uhr" : ""; }
-  function setToday() {
-    var t = L.todayFrom(new Date());
-    if (t !== S.today) { S.today = t; return true; }
-    return false;
+  function clone(x) { return JSON.parse(JSON.stringify(x)); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* egal */ } }
+  function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { /* egal */ } }
+
+  /* ---------- Fellfarben und Vibration (nur auf diesem Handy gespeichert) ---------- */
+
+  function loadLooks() {
+    var raw = lsGet(LOOKS_KEY);
+    try { return L.sanitizeLooks(raw ? JSON.parse(raw) : {}); } catch (e) { return {}; }
+  }
+  function saveLooks() { lsSet(LOOKS_KEY, JSON.stringify(S.looks)); }
+  S.looks = loadLooks();
+  S.haptics = lsGet(HAPTIC_KEY) !== "0";
+
+  function canBuzz() { return typeof navigator.vibrate === "function"; }
+  function buzz(pattern) {
+    if (!S.haptics || !canBuzz()) return;
+    try { navigator.vibrate(pattern); } catch (e) { /* egal */ }
+  }
+
+  // Alle bekannten Tiernamen (Zeitplan und Sure-Cloud), ohne Doppelte
+  function allPetNames() {
+    var st = S.status || {}, seen = {}, out = [];
+    (st.cats || []).concat(st.pets || []).forEach(function (p) {
+      var k = String(p.name || "").trim().toLowerCase();
+      if (k && !seen[k]) { seen[k] = true; out.push(String(p.name).trim()); }
+    });
+    return out;
+  }
+  function lookOf(name) { return L.lookFor(S.looks, allPetNames(), name); }
+
+  // Rundes Gesicht; asleep zeigt geschlossene Augen und kleine z
+  function faceHtml(name, asleep, size, tint) {
+    var look = lookOf(name);
+    return '<span class="face-wrap"><span class="face' + (size ? " " + size : "") + '">' + L.faceSvg(look, !!asleep) + "</span>" +
+      (asleep ? '<span class="zzz" style="--cat-z:' + (tint || look.coat) + '" aria-hidden="true"><i>z</i><i>z</i><i>z</i></span>' : "") + "</span>";
+  }
+
+  function clockNaive() {
+    return L.nowNaive(S.status && S.status.timezone || L.DEFAULT_TZ);
+  }
+  function catByName(status, name) {
+    if (!status) return null;
+    var list = status.cats || [];
+    for (var i = 0; i < list.length; i++) if (list[i].name === name) return list[i];
+    return null;
+  }
+  function isStandalone() {
+    return (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || window.navigator.standalone === true;
+  }
+
+  var I = {
+    paw: '<svg class="paw" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><ellipse cx="12" cy="16.5" rx="5.2" ry="4.2"/><ellipse cx="5.4" cy="10.5" rx="2.1" ry="2.8" transform="rotate(-18 5.4 10.5)"/><ellipse cx="9.6" cy="5.8" rx="2.1" ry="2.9"/><ellipse cx="14.4" cy="5.8" rx="2.1" ry="2.9"/><ellipse cx="18.6" cy="10.5" rx="2.1" ry="2.8" transform="rotate(18 18.6 10.5)"/></svg>',
+    home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 21V11a6.5 6.5 0 0 1 13 0v10"/><path d="M3 21h18"/><path d="M9.5 21v-5.5h5V21"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5.2l3.5 2"/></svg>',
+    more: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5.5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="18.5" cy="12" r="1.9"/></svg>',
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.6v.01"/></svg>',
+    warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.4v.01"/></svg>',
+    ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
+    no: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 6.5H20M8.5 12H20M8.5 17.5H20"/><circle cx="4.5" cy="6.5" r=".9" fill="currentColor"/><circle cx="4.5" cy="12" r=".9" fill="currentColor"/><circle cx="4.5" cy="17.5" r=".9" fill="currentColor"/></svg>',
+    out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M9 7h8v8"/></svg>',
+    inn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 7L7 17M15 17H7V9"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/></svg>',
+    unlock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 6.6-1.4"/></svg>'
+  };
+
+  /* ---------- Speicher ---------- */
+
+  function loadCfg() {
+    var raw = lsGet(CFG_KEY);
+    if (!raw) return null;
+    try {
+      var c = JSON.parse(raw);
+      return c && c.owner && c.repo && c.token ? c : null;
+    } catch (e) { return null; }
+  }
+  function saveCfg(cfg) { lsSet(CFG_KEY, JSON.stringify(cfg)); }
+
+  function cacheSave() {
+    if (S.demo || !S.cfg || !S.status) return;
+    lsSet(CACHE_KEY, JSON.stringify({ key: S.cfg.owner + "/" + S.cfg.repo, status: S.status, runs: S.runs, at: S.fetchedAt,
+      history: S.history ? S.history.slice(0, 80) : null }));
+  }
+  function cacheLoad() {
+    var raw = lsGet(CACHE_KEY);
+    if (!raw) return null;
+    try {
+      var c = JSON.parse(raw);
+      return c && c.key === S.cfg.owner + "/" + S.cfg.repo ? c : null;
+    } catch (e) { return null; }
+  }
+
+  /* ---------- App-Sperre (Hauptpasswort) ---------- */
+
+  function lockEnabled() { return !S.demo && !!window.KLLock && window.KLLock.has(); }
+  function wrongPw() { var e = new Error("wrongpw"); e.kind = "wrongpw"; return e; }
+
+  // Neuester Abdruck: erst von GitHub, ohne Netz die lokale Kopie. null = es gibt keinen.
+  async function currentLockRecord(api) {
+    try {
+      var remote = await api.getLock();
+      if (remote === null) { window.KLLock.clear(); return null; }
+      window.KLLock.write(remote);
+      return remote;
+    } catch (e) {
+      return window.KLLock.has() ? window.KLLock.read() : null;
+    }
+  }
+
+  // Zeigt den Sperrbildschirm. afterUnlock läuft, wenn das Passwort gestimmt hat (oder die Sperre inzwischen aufgehoben wurde).
+  function showLockScreen(cfg, afterUnlock) {
+    S.lock.locked = true;
+    var api = S.api && S.cfg === cfg ? S.api : new L.GitHub(cfg);
+    function finish() { S.lock.locked = false; S.lock.hiddenAt = null; afterUnlock(); }
+    window.KLLock.ui.showUnlock({
+      onUnlock: async function (pw) {
+        var rec = await currentLockRecord(api);
+        if (rec === null) return "released";
+        if (!(await window.KLLock.verify(rec, pw))) throw wrongPw();
+        S.lock.verified = true;
+        return "ok";
+      },
+      onDone: finish,
+      onForgot: function () { S.lock.locked = false; logout(); }
+    });
+    // Wurde die Sperre inzwischen aufgehoben, verschwindet der Bildschirm von selbst
+    currentLockRecord(api).then(function (rec) {
+      if (rec === null && S.lock.locked && window.KLLock.ui.isShowing()) { window.KLLock.ui.hideUnlock(); finish(); }
+    });
+  }
+
+  function resumeAfterLock() {
+    render(true);
+    if (S.api && (!S.fetchedAt || Date.now() - S.fetchedAt > 30000)) refresh(true);
+  }
+
+  function lockNow() {
+    if (!lockEnabled() || !S.cfg || S.lock.locked) return;
+    S.sheet = null;
+    $app.innerHTML = "";
+    showLockScreen(S.cfg, resumeAfterLock);
+  }
+
+  // Nach der Rückkehr in die App: je nach Einstellung wieder nach dem Passwort fragen
+  function maybeLock() {
+    var away = S.lock.hiddenAt == null ? null : Date.now() - S.lock.hiddenAt;
+    S.lock.hiddenAt = null;
+    if (lockEnabled() && S.cfg && !S.lock.locked && window.KLLock.shouldLock(away, window.KLLock.getAfter())) lockNow();
+  }
+
+  // Abgleich mit GitHub (bei jedem Laden). rec: null = keine Sperre, sonst der Abdruck.
+  function syncLock(rec) {
+    if (S.demo || !window.KLLock) return;
+    if (rec === null) { window.KLLock.clear(); S.lock.verified = false; return; }
+    var had = window.KLLock.has();
+    window.KLLock.write(rec);
+    if (!had && !S.lock.verified) lockNow(); // ein anderes Handy hat die Sperre neu eingeschaltet
+  }
+
+  async function lockEnable() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Hauptpasswort festlegen",
+      text: "Mindestens " + window.KLLock.MIN_LEN + " Zeichen. Das Passwort gilt für alle Handys mit diesem Zeitplan und wird nicht im Klartext gespeichert.",
+      submit: "Festlegen",
+      fields: [{ id: "new", label: "Neues Passwort", auto: "new-password" }, { id: "again", label: "Noch einmal", auto: "new-password" }],
+      validate: async function (v) {
+        var bad = window.KLLock.checkPassword(v["new"]);
+        if (bad) return bad;
+        if (v["new"] !== v.again) return "Die beiden Passwörter sind nicht gleich.";
+        try {
+          if ((await S.api.getLock()) !== null) return "Es gibt schon ein Hauptpasswort. Bitte die App neu laden.";
+          var rec = await window.KLLock.makeRecord(v["new"]);
+          await S.api.setLock(rec);
+          window.KLLock.write(rec);
+          S.lock.verified = true;
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Die App-Sperre ist an. Das Passwort gilt auf allen Handys."); }
+  }
+
+  async function lockChange() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Passwort ändern",
+      text: "Das neue Passwort gilt danach auf allen Handys. Deine Partnerin muss es von dir bekommen.",
+      submit: "Ändern",
+      fields: [{ id: "cur", label: "Aktuelles Passwort", auto: "current-password" },
+        { id: "new", label: "Neues Passwort", auto: "new-password" }, { id: "again", label: "Neues Passwort noch einmal", auto: "new-password" }],
+      validate: async function (v) {
+        try {
+          var cur = await currentLockRecord(S.api);
+          if (cur === null) return "Es gibt gar kein Passwort mehr. Bitte die App neu laden.";
+          if (!(await window.KLLock.verify(cur, v.cur))) return "Das aktuelle Passwort stimmt nicht.";
+          var bad = window.KLLock.checkPassword(v["new"]);
+          if (bad) return bad;
+          if (v["new"] !== v.again) return "Die beiden neuen Passwörter sind nicht gleich.";
+          var rec = await window.KLLock.makeRecord(v["new"]);
+          await S.api.setLock(rec);
+          window.KLLock.write(rec);
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Das Passwort wurde geändert."); }
+  }
+
+  async function lockDisable() {
+    var vals = await window.KLLock.ui.askForm({
+      title: "Sperre ausschalten",
+      text: "Danach öffnet sich die App auf allen Handys wieder ohne Passwort.",
+      submit: "Ausschalten",
+      fields: [{ id: "cur", label: "Aktuelles Passwort", auto: "current-password" }],
+      validate: async function (v) {
+        try {
+          var cur = await currentLockRecord(S.api);
+          if (cur !== null) {
+            if (!(await window.KLLock.verify(cur, v.cur))) return "Das Passwort stimmt nicht.";
+            await S.api.deleteLock();
+          }
+          window.KLLock.clear();
+          S.lock.verified = false;
+          return null;
+        } catch (e) { return L.errorText(e); }
+      }
+    });
+    if (vals) { render(true); toast("Die App-Sperre ist aus."); }
+  }
+
+  function lockHtml() {
+    if (S.demo || !window.KLLock || !window.KLLock.supported()) return "";
+    var K = window.KLLock;
+    var html = '<section class="section"><h2>App-Sperre</h2>';
+    if (!K.has()) {
+      html += "<p>Mit einem Hauptpasswort fragt die App beim Öffnen nach, bevor sie etwas zeigt oder schaltet. Das Passwort gilt für alle Handys, die mit diesem Zeitplan verbunden sind.</p>" +
+        '<div class="stack"><button class="btn" data-action="lock-enable">Hauptpasswort festlegen</button></div>';
+    } else {
+      var after = K.getAfter();
+      html += "<p>Die App fragt beim Öffnen nach dem Hauptpasswort. Es gilt für alle Handys mit diesem Zeitplan. Gib es deiner Partnerin einmal weiter.</p>" +
+        '<div class="sel-row"><label for="lock-after">Nachfragen (nur dieses Handy)</label><select class="select select-wide" id="lock-after" data-lock-after="1">' +
+        K.AFTER_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === after ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" +
+        '<div class="stack"><button class="btn" data-action="lock-now">Jetzt sperren</button>' +
+        '<button class="btn btn-quiet" data-action="lock-change">Passwort ändern</button>' +
+        '<button class="btn btn-quiet" data-action="lock-disable">Sperre ausschalten</button></div>';
+    }
+    return html + '<p class="muted small lock-note">Das ist eine Sperre für die App, kein Tresor: Wer den Einrichtungs-Link oder den Zugangsschlüssel hat, kommt auch ohne Passwort an die Daten.</p></section>';
+  }
+
+  /* ---------- Verbinden ---------- */
+
+  function startApp(cfg, api, demo) {
+    S.cfg = cfg; S.api = api; S.demo = !!demo;
+    S.status = null; S.runs = null; S.error = null; S.fetchedAt = null; S.fromCache = false;
+    S.history = null; S.histFilter = null; S.histShown = 30;
+    S.pending = {}; S.sheet = null; S.draft = null; S.saved = null; S.scheduleLoaded = false; S.scheduleError = null;
+    S.tab = "home";
+    S.booting = false;
+    if (!demo) {
+      var cached = cacheLoad();
+      if (cached) {
+        S.status = cached.status; S.runs = cached.runs; S.fetchedAt = cached.at; S.fromCache = true;
+        S.history = Array.isArray(cached.history) ? cached.history : null;
+      }
+    }
+    S.booting = !S.status;
+    render();
+    return refresh(true);
+  }
+
+  async function tryConnect(cfg) {
+    S.setupBusy = true; S.setupError = ""; render();
+    var api = new L.GitHub(cfg);
+    try {
+      await api.getRepo();
+    } catch (e) {
+      S.setupBusy = false;
+      var text = L.errorText(e);
+      if (e.kind === "notfound") text = "Das Repository wurde nicht gefunden. Name und Rechte des Schlüssels prüfen.";
+      S.setupError = text;
+      render();
+      return false;
+    }
+    S.setupBusy = false;
+    var lockRec;
+    try { lockRec = await api.getLock(); } catch (e) { lockRec = undefined; }
+    if (window.KLLock) {
+      window.KLLock.clear();
+      if (lockRec) window.KLLock.write(lockRec);
+    }
+    saveCfg(cfg);
+    if (lockRec && window.KLLock) {
+      S.lock.verified = false;
+      showLockScreen(cfg, function () { startApp(cfg, api, false); });
+      return true;
+    }
+    await startApp(cfg, api, false);
+    return true;
+  }
+
+  function startDemo() {
+    var api = L.createDemo();
+    S.cfg = { owner: "demo", repo: "katzenklappe", token: "demo" };
+    return startApp(S.cfg, api, true);
+  }
+
+  function logout() {
+    lsDel(CFG_KEY); lsDel(CACHE_KEY);
+    if (window.KLLock) { window.KLLock.clear(); if (window.KLLock.ui) window.KLLock.ui.hideUnlock(); }
+    S.lock.locked = false; S.lock.verified = false;
+    S.cfg = null; S.api = null; S.demo = false; S.status = null; S.runs = null; S.history = null; S.pending = {};
+    S.setupError = ""; S.tab = "home";
+    render();
+  }
+
+  /* ---------- Daten holen ---------- */
+
+  // light = ohne Verlauf (beim Warten auf einen Lauf wird er nicht gebraucht)
+  async function fetchState(light) {
+    var res = await Promise.all([
+      S.api.getStatus(),
+      S.api.runs().catch(function () { return null; }),
+      S.api.getOverrides().catch(function () { return null; }),
+      light || !S.api.getHistory ? Promise.resolve(null) : S.api.getHistory().catch(function () { return null; }),
+      S.api.getLock ? S.api.getLock().then(function (r) { return { rec: r }; }, function () { return null; }) : Promise.resolve(null)
+    ]);
+    S.status = res[0];
+    if (res[1]) S.runs = res[1];
+    S.overrides = res[2];
+    if (Array.isArray(res[3])) S.history = res[3];
+    if (res[4]) syncLock(res[4].rec);
+    S.fetchedAt = Date.now();
+    S.fromCache = false;
+    cacheSave();
+    if (window.KLTheme && window.KLTheme.setSun && S.status) window.KLTheme.setSun(S.status.sun, S.status.timezone);
+    return res;
+  }
+
+  async function refresh(quiet) {
+    if (S.loading || !S.api) return;
+    S.loading = true;
+    if (!quiet) render();
+    try {
+      await fetchState();
+      S.error = null;
+    } catch (e) {
+      S.error = e;
+    }
+    S.loading = false;
+    S.booting = false;
+    render();
+  }
+
+  /* ---------- Rechnen mit dem Stand ---------- */
+
+  function newestRun() { return S.runs && S.runs.length ? S.runs[0] : null; }
+  function minutesSince(iso) {
+    var t = Date.parse(iso);
+    return isNaN(t) ? null : Math.max(0, Math.floor((Date.now() - t) / 60000));
+  }
+  function lastCheckLabel() {
+    var r = newestRun();
+    if (!r) return null;
+    var m = minutesSince(r.updatedAt || r.createdAt);
+    return m == null ? null : L.agoLabel(m);
+  }
+  function lastFinishedRun() {
+    var list = S.runs || [];
+    for (var i = 0; i < list.length; i++) if (list[i].status === "completed") return list[i];
+    return null;
+  }
+  function isStale() {
+    var r = newestRun();
+    if (!r) return false;
+    var m = minutesSince(r.createdAt);
+    return m != null && m > STALE_MINUTES;
+  }
+
+  function health() {
+    var st = S.status;
+    if (S.demo) return { tone: "idle", label: "Demo" };
+    if (S.error && !st) return { tone: "bad", label: "Keine Verbindung" };
+    if (!st) return { tone: "idle", label: "Noch kein Stand" };
+    if (st.config_ok === false || st.api_ok === false) return { tone: "bad", label: "Störung" };
+    if ((st.offline || []).length) return { tone: "warn", label: "Hub offline" };
+    if (st.paused) return { tone: "warn", label: "Pausiert" };
+    var f = lastFinishedRun();
+    if (f && f.conclusion && f.conclusion !== "success") return { tone: "warn", label: "Lauf fehlgeschlagen" };
+    if (isStale()) return { tone: "warn", label: "Lauf fehlt" };
+    if ((st.problems || []).length) return { tone: "warn", label: "Hinweis" };
+    if ((st.warnings || []).length) return { tone: "warn", label: "Warnung" };
+    return { tone: "ok", label: "Alles in Ordnung" };
   }
 
   /* ---------- Ansichten ---------- */
-  function dayLabel(date, sh, bds, evs, hol) {
-    var d = +date.slice(8, 10), m = +date.slice(5, 7);
-    var parts = [L.WEEKDAYS[(L.isoWeekday(date) % 7)] + ", " + d + ". " + monthName(m)];
-    if (sh) parts.push(sh.label + (sh.start ? " " + sh.start + " bis " + sh.end : ""));
-    if (hol) parts.push(hol);
-    if (bds.length) parts.push("Geburtstag " + bds.map(function (b) { return b.name; }).join(", "));
-    if (evs.length) parts.push(evs.length + (evs.length === 1 ? " Termin" : " Termine"));
-    return parts.join(", ");
+
+  function noteHtml(tone, title, lines, actionsHtml) {
+    return '<div class="note" data-tone="' + tone + '" role="' + (tone === "bad" ? "alert" : "status") + '">' +
+      (tone === "info" ? I.info : I.warn) +
+      '<div class="note-body"><p><strong>' + esc(title) + "</strong></p>" +
+      (lines || []).map(function (l) { return "<p>" + esc(l) + "</p>"; }).join("") +
+      (actionsHtml ? '<div class="note-actions">' + actionsHtml + "</div>" : "") +
+      "</div></div>";
   }
 
-  function viewMonth() {
-    var D = S.data, y = S.y, m = S.m;
-    var grid = L.monthGrid(y, m);
-    var nowWeek = L.isoWeek(S.sel);
-    var wk = D.shift.enabled ? L.shiftWeekSummary(S.sel, D.shift) : "";
-    var html = '<div class="page"><div class="head"><h1>' + monthName(m) + " <span>" + y + '</span></h1><div class="head-tools">' +
-      '<button class="round" data-action="prev-month" aria-label="Vorheriger Monat">' + I.left + "</button>" +
-      '<button class="pill-btn" data-action="today">Heute</button>' +
-      '<button class="round" data-action="next-month" aria-label="Nächster Monat">' + I.right + "</button></div></div>";
-    html += '<div class="subline">' + (D.shift.enabled ? '<span class="weekchip" data-shift="' + wk + '">KW ' + nowWeek.week + " · " + SHIFT_NAMES[wk] + "</span>" : "") +
-      "<span>heute " + esc(L.shortDate(S.today)) + "</span></div>";
-    html += '<div class="dow" aria-hidden="true"><div>KW</div><div>Mo</div><div>Di</div><div>Mi</div><div>Do</div><div>Fr</div><div>Sa</div><div>So</div></div>';
-    grid.forEach(function (w) {
-      html += '<div class="wk"><div class="kw" aria-hidden="true">' + w.week + "</div>";
-      w.days.forEach(function (date) {
-        var inMonth = +date.slice(5, 7) === m;
-        var sh = L.shiftOn(date, D.shift, D.overrides), hol = L.holidayOn(date);
-        var bds = L.birthdaysOn(D.birthdays, date), evs = L.eventsOn(D.events, date);
-        var red = hol || L.isoWeekday(date) === 7;
-        html += '<button class="day" data-action="pick-day" data-date="' + date + '" aria-pressed="' + (date === S.sel) + '"' +
-          (sh ? ' data-shift="' + sh.type + '"' : "") + (date === S.today ? ' data-today="1"' : "") + (red ? ' data-red="1"' : "") + (inMonth ? "" : ' data-out="1"') +
-          ' aria-label="' + esc(dayLabel(date, sh, bds, evs, hol)) + '">' +
-          '<span class="num">' + (+date.slice(8, 10)) + "</span>" +
-          '<span class="chip"' + (sh && sh.changed ? ' data-changed="1"' : "") + ">" + (sh ? CHIP[sh.type] : "") + "</span>" +
-          '<span class="dots">' + (bds.length ? '<i class="d-bd"></i>' : "") + (evs.length ? '<i class="d-ev"></i>' : "") + "</span></button>";
-      });
-      html += "</div>";
+  function headerHtml() {
+    var h = health();
+    return '<header class="top"><span class="brand"><span class="logo">' + L.faceSvg({ coat: "#FFF6DC", tabby: false, muzzle: true }, false) + "</span>Katzenklappe</span>" +
+      '<span class="pill" data-tone="' + h.tone + '"><span class="dot"></span>' + esc(h.label) + "</span></header>";
+  }
+
+  function bannersHtml() {
+    var st = S.status, out = "";
+    if (!S.online) {
+      out += noteHtml("warn", "Du bist offline.", [S.fetchedAt ? "Angezeigt wird der Stand von " + L.agoLabel(Math.floor((Date.now() - S.fetchedAt) / 60000)) + "." : ""]);
+    } else if (S.error) {
+      out += noteHtml("bad", "Der aktuelle Stand konnte nicht geladen werden.", [L.errorText(S.error)],
+        '<button class="note-btn" data-action="refresh">Nochmal versuchen</button>' +
+        (S.error.kind === "auth" || S.error.kind === "forbidden" ? '<button class="note-btn" data-action="goto-more">Verbindung prüfen</button>' : ""));
+    }
+    if (!st) {
+      if (!S.error) {
+        out += noteHtml("info", "Es gibt noch keinen Stand.",
+          ["Der Zeitplan hat noch nicht gelaufen. Du kannst ihn jetzt einmal starten."],
+          '<button class="note-btn" data-action="run-now">Jetzt starten</button>');
+      }
+      return out;
+    }
+    if (st.config_ok === false) {
+      out += noteHtml("bad", "Der Zeitplan hat einen Fehler.", st.problems || [],
+        '<button class="note-btn" data-action="goto-times">Zeiten öffnen</button>');
+    } else if (st.api_ok === false) {
+      out += noteHtml("bad", "Sure Petcare war beim letzten Lauf nicht erreichbar.", st.problems || []);
+    } else if ((st.problems || []).length) {
+      out += noteHtml("warn", "Beim letzten Lauf gab es ein Problem.", st.problems);
+    }
+    if ((st.offline || []).length) {
+      out += noteHtml("warn", "Hub oder Klappe ist offline.",
+        ["Offline: " + st.offline.join(", ") + ". Sperren kommen so nicht an der Klappe an. Strom und Internet des Hubs prüfen."]);
+    }
+    if (st.paused) {
+      out += noteHtml("warn", "Der Zeitplan ist pausiert.", ["Die Klappe wird nicht automatisch umgestellt."],
+        '<button class="note-btn" data-action="goto-times">Zu den Zeiten</button>');
+    }
+    var f = lastFinishedRun();
+    if (f && f.conclusion && f.conclusion !== "success" && st.config_ok !== false && st.api_ok !== false) {
+      out += noteHtml("warn", "Der letzte Lauf ist fehlgeschlagen.", ["Die Details stehen bei GitHub unter „Actions“."]);
+    }
+    if (isStale() && !S.demo) {
+      var m = minutesSince(newestRun().createdAt);
+      out += noteHtml("warn", "Der Zeitplan hat sich länger nicht gemeldet.",
+        ["Der letzte Lauf war " + L.agoLabel(m) + ". Bei GitHub unter „Actions“ nachsehen, ob der Zeitplan noch aktiv ist."]);
+    }
+    var tz = st.timezone || L.DEFAULT_TZ, nowMs = Date.now();
+    (st.warnings || []).forEach(function (w) {
+      var text = L.warningText(w, tz, nowMs);
+      if (text) out += noteHtml(w.level === "bad" ? "bad" : "warn", L.warningTitle(w), [text]);
     });
-    html += '<div class="legend" aria-hidden="true"><span><i style="background:var(--frueh-solid)"></i>Früh</span><span><i style="background:var(--spaet-solid)"></i>Spät</span>' +
-      '<span><i class="l-dot" style="background:var(--bd)"></i>Geburtstag</span><span><i class="l-dot" style="background:var(--ev)"></i>Termin</span></div>';
-    html += detailHtml(S.sel) + "</div>";
-    return html + '<button class="fab" data-action="new-event" aria-label="Neuer Termin">' + I.plus + "</button>";
+    return out;
   }
 
-  function detailHtml(date) {
-    var D = S.data, sh = L.shiftOn(date, D.shift, D.overrides), hol = L.holidayOn(date);
-    var bds = L.birthdaysOn(D.birthdays, date), evs = L.eventsOn(D.events, date);
-    var html = '<section class="detail" aria-label="Tag ' + esc(L.longDate(date)) + '"><div class="detail-head"><h2>' + esc(L.longDate(date).replace(/ \d{4}$/, "")) + "</h2><span>KW " + L.isoWeek(date).week + "</span></div>";
-    if (D.shift.enabled) {
-      if (sh) {
-        html += '<div class="row shiftrow" data-k="' + sh.type + '"><span class="bar" data-k="' + sh.type + '"></span><div class="row-main"><strong>' + sh.label + "</strong>" +
-          (sh.start ? "<span>" + shiftTimes(sh) + "</span>" : "") +
-          (sh.changed ? "<span>Geändert" + (sh.plan ? " · geplant: " + SHIFT_NAMES[sh.plan] : " · sonst kein Dienst") + "</span>" : "") + "</div>" +
-          '<button class="small-btn" data-action="shift-sheet" data-date="' + date + '">Ändern</button></div>';
-      } else {
-        html += '<div class="row shiftrow"><span class="bar"></span><div class="row-main"><strong>Kein Dienst</strong></div>' +
-          '<button class="small-btn" data-action="shift-sheet" data-date="' + date + '">Schicht eintragen</button></div>';
+  function installHintHtml() {
+    if (S.demo || isStandalone() || lsGet(HINT_KEY) === "1") return "";
+    var btn = S.installEvt
+      ? '<button class="note-btn" data-action="install">Installieren</button>'
+      : "";
+    return noteHtml("info", "Als App auf den Startbildschirm legen",
+      S.installEvt ? ["Dann öffnet sich die Klappe mit einem Tipp wie jede andere App."]
+        : ["Im Chrome-Menü (drei Punkte oben rechts) „Zum Startbildschirm hinzufügen“ wählen."],
+      btn + '<button class="note-btn" data-action="hint-dismiss">Nicht mehr zeigen</button>');
+  }
+
+  function segHtml(list) {
+    return list.map(function (s) {
+      return '<span class="bar-seg" style="left:' + s.from.toFixed(3) + "%;width:" + (s.to - s.from).toFixed(3) + '%"></span>';
+    }).join("");
+  }
+
+  // Tagesleiste: gesperrte Abschnitte (Liste in Prozent), Jetzt-Markierung (oder null), Text darunter
+  function ticksHtml() {
+    return '<div class="bar-ticks" aria-hidden="true"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>';
+  }
+  function barHtml(segs, nowPct, caption, ticks) {
+    return '<div class="bar"><div class="bar-track">' + segHtml(segs) + "</div>" +
+      (nowPct == null ? "" : '<span class="bar-now" style="--p:' + nowPct.toFixed(3) + '"></span>') + "</div>" +
+      (ticks ? ticksHtml() : "") +
+      (caption ? '<p class="bar-caption">' + esc(caption) + "</p>" : "");
+  }
+
+  // Leiste fuer ein Tier aus dem Status (Plan, sonst die alten Felder lock/unlock)
+  function catBarHtml(c, naive) {
+    var day = naive.slice(0, 10);
+    if (c.plan) {
+      return barHtml(L.planSegments(c.plan, day), L.nowPercent(naive),
+        L.planCaption(c.plan, day, c.lock && c.unlock ? [c.lock, c.unlock] : null), true);
+    }
+    if (c.lock && c.unlock) {
+      return barHtml(L.barSegments(c.lock, c.unlock), L.nowPercent(naive), "Gesperrt von " + c.lock + " bis " + c.unlock + " Uhr", true);
+    }
+    return "";
+  }
+
+  function pendingTexts(p) {
+    switch (p.phase) {
+      case "saving": return ["Wird gespeichert …", ""];
+      case "dispatch": return ["Lauf wird gestartet …", ""];
+      case "waiting": return ["Klappe wird umgestellt …", "Das dauert etwa eine Minute. Du kannst die App schließen."];
+      case "slow": return ["Das dauert länger als üblich.", "Die Änderung ist gespeichert. Der nächste automatische Lauf übernimmt sie spätestens in etwa 30 Minuten."];
+      case "nodispatch": return ["Gespeichert, aber der Lauf startet nicht sofort.", "Der nächste automatische Lauf übernimmt es spätestens in etwa 30 Minuten. " + L.errorText(p.error)];
+      case "failed": return ["Der Lauf ist fehlgeschlagen.", "Die Änderung ist gespeichert. Details stehen bei GitHub unter „Actions“."];
+      default: return ["Das hat nicht geklappt.", p.error ? L.errorText(p.error) : ""];
+    }
+  }
+  function pendingDone(p) { return ["slow", "nodispatch", "failed", "error"].indexOf(p.phase) >= 0; }
+
+  function busyHtml(key, p) {
+    var t = pendingTexts(p), done = pendingDone(p);
+    return '<div class="busy" role="status"><p class="busy-text">' + esc(t[0]) + "</p>" +
+      (t[1] ? '<p class="busy-sub">' + esc(t[1]) + "</p>" : "") +
+      (done ? '<div class="cat-actions"><button class="cat-btn" data-action="dismiss-pending" data-key="' + esc(key) + '">Schließen</button></div>'
+        : '<div class="paws" aria-hidden="true">' + I.paw + I.paw + I.paw + I.paw + "</div>") + "</div>";
+  }
+
+  // Gespeicherte Sonderregel (Variable) eines Tiers, falls noch nicht abgelaufen
+  function savedOverride(name, naive) {
+    if (!S.overrides) return null;
+    var keys = Object.keys(S.overrides);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].trim().toLowerCase() === name.trim().toLowerCase()) {
+        var o = S.overrides[keys[i]];
+        return o && o.until > naive ? o : null;
       }
     }
-    if (hol) html += '<div class="row"><span class="bar" data-k="holiday"></span><div class="row-main"><strong>' + esc(hol) + "</strong><span>Feiertag in Berlin</span></div></div>";
-    bds.forEach(function (b) {
-      html += '<div class="row"><span class="bar" data-k="bd"></span><div class="row-main"><strong>' + esc(b.name) + "</strong><span>Geburtstag" + (b.age ? " · wird " + b.age : "") + "</span></div></div>";
-    });
-    evs.forEach(function (e) {
-      html += '<button class="row row-btn" data-action="edit-event" data-id="' + esc(e.id) + '" data-date="' + date + '"><span class="bar" data-k="ev"></span><div class="row-main"><strong>' + esc(e.title) + "</strong><span>" +
-        esc(L.eventTimeLabel(e)) + (e.repeat !== "none" ? " · " + L.REPEATS[e.repeat].toLowerCase() : "") + "</span>" +
-        (e.notes ? '<span class="note">' + esc(e.notes) + "</span>" : "") + "</div></button>";
-    });
-    if (!evs.length && !bds.length) html += '<p class="empty">Keine Termine. Mit „+“ legst du einen an.</p>';
+    return null;
+  }
+
+  // Text, wenn die gespeicherte Sonderregel noch nicht vom Zeitplan übernommen wurde
+  function queuedLabel(c, naive) {
+    if (!S.overrides) return "";
+    var saved = savedOverride(c.name, naive), cur = L.activeOverride(c, naive);
+    if (!saved && !cur) return "";
+    if (saved && cur && saved.state === cur.state && saved.until === cur.until) return "";
+    if (!saved) return "Gespeichert: Der Zeitplan gilt wieder. Das wird beim nächsten Lauf übernommen.";
+    return "Gespeichert: " + (saved.state === "locked" ? "drinnen bleiben" : "draußen erlaubt") +
+      " bis " + L.whenLabel(naive, saved.until) + ". Das wird beim nächsten Lauf übernommen.";
+  }
+
+  function descOpts() {
+    var st = S.status || {};
+    return { lead: st.lead_minutes || 0, tz: st.timezone || L.DEFAULT_TZ, nowMs: Date.now() };
+  }
+
+  // Aktivitaet eines Tieres aus dem Verlauf (null, solange der Verlauf fehlt)
+  function activityOf(pet) {
+    if (!S.history) return null;
+    var o = descOpts();
+    return L.activityFor(S.history, pet, o.tz, o.nowMs, 7);
+  }
+
+  function catCardHtml(c, naive) {
+    var d = L.describeCat(c, naive, descOpts());
+    var activity = L.activityLine(activityOf(c));
+    var p = S.pending[c.name];
+    var o = descOpts(), asleep = d.tone === "night", look = lookOf(c.name);
+    var where = d.location === "inside" ? "Drinnen" : d.location === "outside" ? "Draußen" : "";
+    var since = where && c.location_since ? " " + L.sinceLabel(c.location_since, o.tz, o.nowMs) : "";
+    var sub = d.sub;
+    if (!sub && !asleep && Array.isArray(c.rules) && !c.rules.length) sub = "Kein Zeitplan: immer frei";
+    var html = '<section class="cat" data-tone="' + d.tone + '" style="--coat:' + look.coat + '" aria-label="' + esc(c.name) + '">' +
+      '<div class="cat-head">' + faceHtml(c.name, asleep, "") + '<div class="cat-id"><h2 class="cat-name">' + esc(c.name) + "</h2>" +
+      (where ? '<p class="cat-where">' + esc(where + since) + "</p>" : "") + "</div></div>" +
+      '<div class="state">' + (asleep ? I.lock : I.unlock) + '<div class="state-text"><span class="cat-state">' + esc(d.headline) + "</span>" +
+      (sub ? '<span class="cat-sub">' + esc(sub) + "</span>" : "") + "</div></div>" +
+      (d.location === "outside" && asleep ? '<p class="cat-note">' + esc(c.name) + " ist noch draußen und kann nur noch hinein.</p>" : "") +
+      (activity ? '<p class="cat-activity">' + esc(activity) + "</p>" : "") +
+      catBarHtml(c, naive) +
+      (d.override ? '<p class="cat-override">' + esc(d.overrideLabel) + "</p>" : "");
+    var queued = p ? "" : queuedLabel(c, naive);
+    if (queued) html += '<p class="cat-override" data-queued="1">' + esc(queued) + "</p>";
+    if (p) {
+      html += busyHtml(c.name, p);
+    } else {
+      html += '<div class="cat-actions"><button class="cat-btn" data-action="open-sheet" data-name="' + esc(c.name) + '" data-locked="' + (d.wantLocked ? "0" : "1") + '">' +
+        (d.wantLocked ? "Jetzt rauslassen" : "Jetzt drinnen lassen") + "</button>" +
+        (d.override || savedOverride(c.name, naive) ? '<button class="cat-link" data-action="clear-override" data-name="' + esc(c.name) + '">Zeitplan wieder gelten lassen</button>' : "") +
+        "</div>";
+    }
     return html + "</section>";
   }
 
-  function viewYear() {
-    var D = S.data, y = S.year;
-    var html = '<div class="page"><div class="head"><h1>' + y + '</h1><div class="head-tools">' +
-      '<button class="round" data-action="prev-year" aria-label="Vorheriges Jahr">' + I.left + "</button>" +
-      '<button class="pill-btn" data-action="today">Heute</button>' +
-      '<button class="round" data-action="next-year" aria-label="Nächstes Jahr">' + I.right + "</button></div></div>" +
-      '<div class="subline"><span>Tippe auf einen Monat. Farben: Früh · Spät · Urlaub · frei.</span></div><div class="year-grid">';
-    for (var m = 1; m <= 12; m++) {
-      var first = L.ymd(y, m, 1), lead = L.isoWeekday(first) - 1, n = L.daysInMonth(y, m);
-      var cells = "";
-      for (var i = 0; i < lead; i++) cells += "<span></span>";
-      for (var d = 1; d <= n; d++) {
-        var date = L.ymd(y, m, d), sh = L.shiftOn(date, D.shift, D.overrides);
-        var mark = L.birthdaysOn(D.birthdays, date).length || L.eventsOn(D.events, date).length;
-        cells += "<span" + (sh ? ' data-shift="' + sh.type + '"' : "") + (date === S.today ? ' data-today="1"' : "") + (mark ? ' data-mark="1"' : "") + ">" + d + "</span>";
+  function skeletonHtml() {
+    var one = '<section class="cat skel" aria-hidden="true"><div class="cat-head"><span class="face-wrap"><span class="face"></span></span>' +
+      '<div class="cat-id" style="flex:1"><div class="skel-line w1"></div><div class="skel-line w2"></div></div></div>' +
+      '<div class="skel-line w3"></div><div class="skel-line w4"></div></section>';
+    return '<div role="status" aria-label="Wird geladen">' + one + one + "</div>";
+  }
+  function loadingCardHtml() {
+    return '<div class="card" role="status" aria-label="Wird geladen"><div class="skel-line w1"></div><div class="skel-line w2"></div><div class="skel-line w4"></div></div>';
+  }
+
+  function bulkHtml() {
+    var st = S.status;
+    if (!st || (st.cats || []).length < 2) return "";
+    var naive = clockNaive(), p = S.pending["__bulk"];
+    var any = (st.cats || []).some(function (c) { return c.override; }) || (S.overrides && Object.keys(L.pruneOverrides(S.overrides, naive)).length);
+    return '<section class="card" aria-label="Alle Tiere"><h2 class="card-title">Alle Tiere</h2>' +
+      '<p class="card-sub">Gilt für alle Tiere mit Zeitplan auf einmal.</p>' +
+      (p ? busyHtml("__bulk", p)
+        : '<div class="cat-actions two"><button class="cat-btn" data-action="open-bulk" data-locked="1">Alle drinnen lassen</button>' +
+          '<button class="cat-btn" data-action="open-bulk" data-locked="0">Alle rauslassen</button>' +
+          (any ? '<button class="cat-link" data-action="clear-all-overrides">Für alle den Zeitplan wieder gelten lassen</button>' : "") + "</div>") +
+      "</section>";
+  }
+
+  // Hinweis auf laufenden oder bald beginnenden Urlaub
+  function vacationNoteHtml(naive) {
+    var st = S.status, today = naive.slice(0, 10), soon = L.addDays(today + "T00:00", 7).slice(0, 10);
+    var list = (st && st.vacations) || [];
+    var now = list.filter(function (v) { return v.from <= today && today <= v.to; });
+    var next = list.filter(function (v) { return v.from > today && v.from <= soon; });
+    if (!now.length && !next.length) return "";
+    var lines = now.map(function (v) {
+      return vacWho(v) + ": " + vacWhat(v) + " bis " + fmtDate(v.to, v.to.slice(0, 4) !== today.slice(0, 4)) + (v.note ? " (" + v.note + ")" : "") + ".";
+    }).concat(next.map(function (v) {
+      return "Ab " + fmtDate(v.from, false) + ": " + vacWho(v) + ", " + vacWhat(v) + (v.note ? " (" + v.note + ")" : "") + ".";
+    }));
+    return noteHtml("info", now.length ? "Gerade gilt eine Ausnahme vom Wochenplan" : "Bald gilt eine Ausnahme vom Wochenplan", lines,
+      '<button class="note-btn" data-action="goto-times">Zu den Zeiten</button>');
+  }
+
+  function othersHtml() {
+    var st = S.status;
+    if (!st || !(st.pets || []).length) return "";
+    var scheduled = (st.cats || []).map(function (c) { return c.name.trim().toLowerCase(); });
+    var others = st.pets.filter(function (p) { return scheduled.indexOf(p.name.trim().toLowerCase()) < 0; });
+    if (!others.length) return "";
+    var o = descOpts();
+    return '<section class="card" aria-label="Weitere Tiere"><h2 class="card-title">Weitere Tiere</h2>' +
+      '<p class="card-sub">Ohne Zeitplan in dieser App.</p><ul class="pet-list">' +
+      others.map(function (p) {
+        var where = p.location === "inside" ? "drinnen" : p.location === "outside" ? "draußen" : "";
+        var since = where && p.location_since ? " " + L.sinceLabel(p.location_since, o.tz, o.nowMs) : "";
+        var act = L.activityLine(activityOf(p));
+        return '<li class="pet-row">' + faceHtml(p.name, false, "face-md") + "<div>" +
+          "<strong>" + esc(p.name) + "</strong>" +
+          '<span class="pet-where">' + (where ? esc(where.charAt(0).toUpperCase() + where.slice(1) + since) : "Ort unbekannt") + "</span>" +
+          (act ? '<span class="pet-act">' + esc(act) + "</span>" : "") + "</div></li>";
+      }).join("") + "</ul></section>";
+  }
+
+  function gaugeHtml(d, warnAt) {
+    var pct = d.battery_pct, tone = L.batteryTone(pct, warnAt);
+    var volts = typeof d.battery_v === "number" ? String(d.battery_v).replace(".", ",") + " Volt. " : "";
+    return '<div class="gauge" data-tone="' + tone + '">' +
+      '<div class="gauge-row"><span>Batterie</span><strong>' + (pct == null ? "unbekannt" : pct + " %") + "</strong></div>" +
+      (pct == null ? "" : '<div class="gauge-track" role="img" aria-label="Batterie ' + pct + ' Prozent"><span style="width:' + pct + '%"></span></div>') +
+      '<p class="gauge-sub">' + esc(volts + "Die Prozentzahl ist aus der Spannung geschätzt.") + "</p>" + batteryTrendHtml(d) + "</div>";
+  }
+
+  function batteryTrendHtml(d) {
+    var log = d.battery_log;
+    if (!Array.isArray(log)) return "";
+    var now = Date.now();
+    var pts = L.batterySamples(log, now).filter(function (s) { return s.ms >= now - 60 * 86400000; });
+    var o = L.batteryOutlook(log, now);
+    var html = '<div class="trend"><p class="form-label">Verlauf der Spannung</p>';
+    if (pts.length >= 2) {
+      var W = 300, H = 72, pad = 8;
+      var vmin = Math.min.apply(null, pts.map(function (s) { return s.v; })), vmax = Math.max.apply(null, pts.map(function (s) { return s.v; }));
+      // Die "leer"-Linie nur zeichnen, wenn sie nah genug ist; sonst wuerde die Kurve flach gedrueckt
+      var showEmpty = vmin - L.BATTERY_EMPTY_V < 0.35;
+      var lo = (showEmpty ? Math.min(vmin, L.BATTERY_EMPTY_V) : vmin) - 0.05, hi = Math.max(vmax, lo + 0.3) + 0.05;
+      var t0 = pts[0].ms, t1 = Math.max(pts[pts.length - 1].ms, t0 + 86400000);
+      var xy = pts.map(function (s) {
+        return [pad + (s.ms - t0) / (t1 - t0) * (W - 2 * pad), H - pad - (s.v - lo) / (hi - lo) * (H - 2 * pad)];
+      });
+      var yEmpty = H - pad - (L.BATTERY_EMPTY_V - lo) / (hi - lo) * (H - 2 * pad);
+      var last = xy[xy.length - 1];
+      html += '<svg class="spark" viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="Spannung der Batterie in den letzten Wochen: von ' +
+        String(pts[0].v).replace(".", ",") + " auf " + String(pts[pts.length - 1].v).replace(".", ",") + ' Volt">' +
+        (showEmpty ? '<line class="spark-empty" x1="' + pad + '" x2="' + (W - pad) + '" y1="' + yEmpty.toFixed(1) + '" y2="' + yEmpty.toFixed(1) + '"/>' +
+          '<text class="spark-note" x="' + pad + '" y="' + (yEmpty - 5).toFixed(1) + '">leer</text>' : "") +
+        '<polyline class="spark-line" points="' + xy.map(function (q) { return q[0].toFixed(1) + "," + q[1].toFixed(1); }).join(" ") + '"/>' +
+        '<circle class="spark-dot" cx="' + last[0].toFixed(1) + '" cy="' + last[1].toFixed(1) + '" r="5"/></svg>' +
+        '<div class="spark-axis"><span>' + esc("vor " + Math.max(1, Math.round((now - t0) / 86400000)) + " Tagen") + "</span><span>heute</span></div>";
+    }
+    return html + '<p class="gauge-sub">' + esc(L.batteryOutlookText(o)) + "</p></div>";
+  }
+
+  function signalHtml(db) {
+    var lvl = L.signalLevel(db);
+    return '<div class="sig-row"><span>Funkverbindung</span><span class="sig-val">' +
+      '<span class="sig" data-level="' + lvl + '" aria-hidden="true"><i></i><i></i><i></i><i></i></span>' +
+      "<strong>" + esc(L.signalLabel(db)) + "</strong></span></div>";
+  }
+
+  function devicesHtml() {
+    var st = S.status, devs = (st && st.devices) || [];
+    if (!devs.length) return "";
+    var a = st.alerts || {};
+    var warnAt = a.enabled === false ? 0 : (a.battery_percent == null ? L.DEFAULT_ALERTS.battery_percent : a.battery_percent);
+    var html = '<section class="card" aria-label="Klappe und Hub"><h2 class="card-title">Klappe und Hub</h2>';
+    devs.filter(function (d) { return d.kind === "flap"; }).forEach(function (d) {
+      html += gaugeHtml(d, warnAt) + (typeof d.signal_db === "number" ? signalHtml(d.signal_db) : "");
+    });
+    html += '<ul class="dev-list">' + devs.map(function (d) {
+      var kind = d.kind === "flap" ? "Klappe" : d.kind === "hub" ? "Hub" : "Gerät";
+      var state = d.online === true ? "online" : d.online === false ? "offline" : "unbekannt";
+      return '<li><span class="dot" data-on="' + (d.online === true ? "1" : d.online === false ? "0" : "") + '"></span>' +
+        "<span>" + esc(kind + (d.name ? " „" + d.name + "“" : "")) + "</span><small>" + state + "</small></li>";
+    }).join("") + "</ul></section>";
+    return html;
+  }
+
+  function viewHome() {
+    var naive = clockNaive();
+    var cats = (S.status && S.status.cats) || [];
+    if (!S.status && S.booting && !S.error) return headerHtml() + skeletonHtml();
+    var html = headerHtml() + bannersHtml() + vacationNoteHtml(naive);
+    cats.forEach(function (c) { html += catCardHtml(c, naive); });
+    html += bulkHtml() + othersHtml() + devicesHtml();
+    var ago = lastCheckLabel();
+    html += '<div class="meta"><span>' +
+      (S.loading ? "Wird aktualisiert …" : (ago ? "Zuletzt geprüft " + esc(ago) : "")) +
+      '</span><button data-action="refresh">Aktualisieren</button></div>';
+    html += '<div style="height:16px"></div>' + installHintHtml();
+    return html;
+  }
+
+  /* ----- Verlauf ----- */
+
+  var DAY_SHORT = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+
+  function historyNames() {
+    var st = S.status || {}, seen = {}, out = [];
+    function add(n) {
+      var k = String(n || "").trim().toLowerCase();
+      if (k && !seen[k]) { seen[k] = true; out.push(String(n).trim()); }
+    }
+    (st.cats || []).forEach(function (c) { add(c.name); });
+    (st.pets || []).forEach(function (p) { add(p.name); });
+    (S.history || []).forEach(function (e) { add(e.cat); });
+    return out;
+  }
+
+  function petOrStub(name) {
+    var st = S.status || {}, key = name.trim().toLowerCase(), i, list = (st.pets || []).concat(st.cats || []);
+    for (i = 0; i < list.length; i++) if (list[i].name.trim().toLowerCase() === key) return list[i];
+    return { name: name, location: "unknown", location_since: null };
+  }
+
+  function weekHtml(name) {
+    var pet = petOrStub(name), act = activityOf(pet);
+    if (!act || !act.hasData) return "";
+    var o = descOpts();
+    var firstDay = act.firstT ? L.utcToNaive(act.firstT, o.tz).slice(0, 10) : "9999-99-99";
+    var max = Math.max(60, Math.max.apply(null, act.perDay.map(function (d) { return d.minutes; })));
+    // Durchschnitt nur aus vollen Tagen (ohne heute) und erst, wenn es mindestens zwei davon gibt
+    var done = act.perDay.slice(0, -1).filter(function (d) { return d.date > firstDay; });
+    var total = done.reduce(function (n, d) { return n + d.minutes; }, 0);
+    var known = done.length;
+    var cols = act.perDay.map(function (d, i) {
+      var isKnown = d.date >= firstDay, h = isKnown ? Math.max(d.minutes ? 4 : 0, Math.round(d.minutes / max * 100)) : 0;
+      var label = i === act.perDay.length - 1 ? "heute" : DAY_SHORT[L.toDate(d.date + "T00:00").getUTCDay()];
+      return '<li class="wk-col" data-known="' + (isKnown ? "1" : "0") + '"><span class="wk-val">' +
+        esc(isKnown ? L.durationShort(d.minutes) : "–") + '</span><span class="wk-bar"><i style="height:' + h + '%"></i></span>' +
+        '<span class="wk-day">' + esc(label) + "</span></li>";
+    }).join("");
+    return '<section class="card" aria-label="Draußen pro Tag, ' + esc(name) + '"><h2 class="card-title">' + esc(name) + ": Zeit draußen</h2>" +
+      '<p class="card-sub">Pro Tag, die letzten 7 Tage' +
+      (known >= 2 ? ". Im Schnitt " + esc(L.durationLabel(total / known).replace(/\.$/, "")) + " am Tag." : ". Der Verlauf füllt sich mit jedem Tag.") +
+      '</p><ol class="week" style="--coat:' + lookOf(name).coat + '">' + cols + "</ol></section>";
+  }
+
+  function eventRowHtml(r) {
+    var icon = r.kind === "lock" ? (r.e.to === "locked" ? I.lock : I.unlock) : r.dir === "out" ? I.out : I.inn;
+    var tone = r.kind === "lock" ? "lock" : r.dir === "out" ? "out" : "in";
+    return '<li class="ev" data-kind="' + tone + '"><span class="ev-time">' + esc(r.time) + '</span><span class="ev-icon">' + icon +
+      '</span><span class="ev-text">' + esc(r.text) +
+      (r.outMin != null ? "<small>war " + esc(L.durationLabel(r.outMin)) + " draußen</small>" : "") + "</span></li>";
+  }
+
+  function viewHistory() {
+    var html = '<h1 class="page-title">Verlauf</h1>';
+    if (!S.status && !S.history) {
+      return html + (S.error ? noteHtml("bad", "Der Verlauf konnte nicht geladen werden.", [L.errorText(S.error)],
+        '<button class="note-btn" data-action="refresh">Nochmal versuchen</button>') : loadingCardHtml());
+    }
+    if (!S.history) {
+      return html + noteHtml("info", "Der Verlauf ist noch nicht da.", ["Er wird mit dem nächsten Aktualisieren geladen."],
+        '<button class="note-btn" data-action="refresh">Aktualisieren</button>');
+    }
+    var names = historyNames();
+    var filter = S.histFilter && names.indexOf(S.histFilter) >= 0 ? S.histFilter : null;
+    html += '<div class="chips" role="group" aria-label="Tier wählen">' +
+      ['<button class="chip" data-action="hist-filter" data-name="" aria-pressed="' + (filter ? "false" : "true") + '">Alle</button>']
+        .concat(names.map(function (n) {
+          return '<button class="chip" data-action="hist-filter" data-name="' + esc(n) + '" aria-pressed="' + (filter === n ? "true" : "false") + '">' + esc(n) + "</button>";
+        })).join("") + "</div>";
+    (filter ? [filter] : names).forEach(function (n) { html += weekHtml(n); });
+
+    var o = descOpts(), nowNv = L.nowNaive(o.tz);
+    var rows = L.annotateEvents(S.history, o.tz).filter(function (r) { return !filter || r.name === filter; });
+    if (!rows.length) {
+      html += '<p class="muted">Noch keine Einträge. Sobald die Klappe benutzt wird, erscheint es hier.</p>';
+    } else {
+      var shown = rows.slice(0, S.histShown), lastDate = null;
+      html += '<h2 class="list-title">Letzte Ereignisse</h2>';
+      shown.forEach(function (r) {
+        if (r.date !== lastDate) {
+          if (lastDate !== null) html += "</ul>";
+          html += '<h3 class="day-title">' + esc(L.dayHeading(nowNv, r.date)) + '</h3><ul class="events">';
+          lastDate = r.date;
+        }
+        html += eventRowHtml(r);
+      });
+      html += "</ul>";
+      if (rows.length > shown.length) {
+        html += '<div class="stack"><button class="btn btn-quiet btn-wide" data-action="hist-more">Mehr anzeigen (' + (rows.length - shown.length) + ")</button></div>";
       }
-      html += '<button class="mini" data-action="open-month" data-y="' + y + '" data-m="' + m + '"' + (S.today.slice(0, 7) === y + "-" + L.pad(m) ? ' data-now="1"' : "") + ' aria-label="' + monthName(m) + " " + y + ' öffnen"><h3>' + monthName(m) + '</h3><div class="mini-grid" aria-hidden="true">' +
-        "<b>M</b><b>D</b><b>M</b><b>D</b><b>F</b><b>S</b><b>S</b>" + cells + "</div></button>";
+    }
+    html += '<p class="muted small">Der Verlauf kommt aus der Sure-Cloud und wird bei jedem Lauf ergänzt (etwa alle 30 Minuten). Die letzten drei Wochen bleiben gespeichert.</p>';
+    return html;
+  }
+
+  /* ----- Zeiten ----- */
+
+  function timesStatusHtml() {
+    var p = S.pending["__schedule"];
+    if (!p) return "";
+    var t = pendingTexts(p), done = pendingDone(p);
+    return '<div class="note" data-tone="' + (done && p.phase !== "slow" ? "warn" : "info") + '" role="status">' + I.info +
+      '<div class="note-body"><p><strong>' + esc(t[0]) + "</strong></p>" + (t[1] ? "<p>" + esc(t[1]) + "</p>" : "") +
+      (done ? '<div class="note-actions"><button class="note-btn" data-action="dismiss-pending" data-key="__schedule">Schließen</button></div>' : "") +
+      "</div></div>";
+  }
+
+  function saveBarHtml() {
+    var errors = L.validateSchedule(S.draft);
+    var dirty = !L.sameSchedule(S.draft, S.saved);
+    var busy = !!S.pending["__schedule"] && !pendingDone(S.pending["__schedule"]);
+    var list = dirty && errors.length
+      ? '<ul class="errors">' + errors.map(function (e) { return "<li>" + esc(e) + "</li>"; }).join("") + "</ul>" : "";
+    return list + '<button class="btn btn-wide" data-action="save-times"' + (!dirty || errors.length || busy ? " disabled" : "") + ">" +
+      (dirty ? "Änderungen speichern" : "Keine Änderungen") + "</button>";
+  }
+
+  var CITIES = [["Berlin", 52.52, 13.405], ["Hamburg", 53.55, 9.99], ["München", 48.14, 11.58], ["Köln", 50.94, 6.96],
+    ["Frankfurt am Main", 50.11, 8.68], ["Stuttgart", 48.78, 9.18], ["Düsseldorf", 51.23, 6.78], ["Leipzig", 51.34, 12.37],
+    ["Dresden", 51.05, 13.74], ["Hannover", 52.37, 9.73], ["Nürnberg", 49.45, 11.08], ["Bremen", 53.08, 8.8],
+    ["Wien", 48.21, 16.37], ["Zürich", 47.38, 8.54]];
+  var OFFSETS = [-120, -90, -60, -45, -30, -15, 0, 15, 30, 45, 60, 90, 120];
+
+  function draftTz() { return (S.draft && S.draft.timezone) || (S.status && S.status.timezone) || L.DEFAULT_TZ; }
+
+  function offsetLabel(n) {
+    return n === 0 ? "genau" : Math.abs(n) + " Min. " + (n < 0 ? "vorher" : "nachher");
+  }
+
+  // Auswahl "Uhrzeit | Sonnenuntergang | Sonnenaufgang" plus Uhrzeit bzw. Versatz
+  function whenEditHtml(base, label, value, attrs) {
+    var kind = L.whenKind(value);
+    var kinds = [["clock", "Uhrzeit"], ["sunset", "Sonnenuntergang"], ["sunrise", "Sonnenaufgang"]];
+    var html = '<div class="when-row"><label class="when-label" for="' + base + '">' + esc(label) + '</label><div class="when-ctrl">' +
+      '<select class="select select-sm" id="' + base + '-k" aria-label="Art: ' + esc(label) + '" data-when="kind" ' + attrs + ">" +
+      kinds.map(function (k) { return '<option value="' + k[0] + '"' + (k[0] === kind ? " selected" : "") + ">" + k[1] + "</option>"; }).join("") + "</select>";
+    if (kind === "clock") {
+      html += '<input class="time-input" type="time" id="' + base + '" ' + attrs + ' value="' + esc(L.isHHMM(value) ? value : "") + '">';
+    } else {
+      var off = L.whenOffset(value), list = OFFSETS.indexOf(off) >= 0 ? OFFSETS : OFFSETS.concat([off]).sort(function (x, y) { return x - y; });
+      html += '<select class="select select-sm" id="' + base + '" aria-label="Versatz: ' + esc(label) + '" data-when="offset" ' + attrs + ">" +
+        list.map(function (n) { return '<option value="' + n + '"' + (n === off ? " selected" : "") + ">" + offsetLabel(n) + "</option>"; }).join("") + "</select>";
     }
     return html + "</div></div>";
   }
 
-  function viewAgenda() {
-    var D = S.data, items = L.agendaFrom(D, S.today, 186);
-    var html = '<div class="page"><div class="head"><h1>Termine</h1></div><div class="subline"><span>Die nächsten sechs Monate</span></div>';
-    if (!items.length) html += '<p class="empty">Nichts eingetragen. Mit „+“ legst du einen Termin an.</p>';
-    html += '<div class="agenda">';
-    items.forEach(function (it) {
-      html += "<section><h3>" + esc(L.shortDate(it.date)) + (it.date === S.today ? " <em>heute</em>" : "") + '</h3><div class="card">';
-      if (it.holiday) html += '<div class="row"><span class="bar" data-k="holiday"></span><div class="row-main"><strong>' + esc(it.holiday) + "</strong><span>Feiertag in Berlin</span></div></div>";
-      it.birthdays.forEach(function (b) { html += '<div class="row"><span class="bar" data-k="bd"></span><div class="row-main"><strong>' + esc(b.name) + "</strong><span>Geburtstag" + (b.age ? " · wird " + b.age : "") + "</span></div></div>"; });
-      it.events.forEach(function (e) {
-        html += '<button class="row row-btn" data-action="edit-event" data-id="' + esc(e.id) + '" data-date="' + it.date + '"><span class="bar" data-k="ev"></span><div class="row-main"><strong>' + esc(e.title) + "</strong><span>" + esc(L.eventTimeLabel(e)) + "</span>" +
-          (e.notes ? '<span class="note">' + esc(e.notes) + "</span>" : "") + "</div></button>";
-      });
-      html += "</div></section>";
-    });
-    return html + '</div></div><button class="fab" data-action="new-event" aria-label="Neuer Termin">' + I.plus + "</button>";
+  function modeSwitchHtml(c, i) {
+    var mode = L.catMode(c);
+    return '<div class="seg" role="group" aria-label="Art des Zeitplans">' + [
+      ["daily", "Jeden Tag gleich"], ["weekly", "Je Wochentag"], ["none", "Kein fester Zeitplan"]
+    ].map(function (m) {
+      return '<button class="seg-btn" data-action="cat-mode" data-idx="' + i + '" data-mode="' + m[0] + '" aria-pressed="' + (mode === m[0]) + '">' + m[1] + "</button>";
+    }).join("") + "</div>";
   }
 
-  function weekPreview() {
-    var D = S.data, out = [], mon = L.mondayOf(S.today);
-    for (var i = 0; i < 4; i++) {
-      var d = L.addDays(mon, i * 7);
-      out.push("KW " + L.isoWeek(d).week + " " + (L.shiftWeekSummary(d, D.shift) === "frueh" ? "Früh" : "Spät"));
-    }
-    return out.join(" · ");
+  function ruleHtml(c, i, r, j) {
+    var attrs = 'data-idx="' + i + '" data-rule="' + j + '"';
+    var days = L.DAY_ABBR.map(function (d, k) {
+      return '<button class="chip chip-day" data-action="toggle-day" data-idx="' + i + '" data-rule="' + j + '" data-day="' + k +
+        '" aria-pressed="' + (r.days.indexOf(k) >= 0) + '" aria-label="' + L.DAY_NAMES[k] + '">' + d + "</button>";
+    }).join("");
+    return '<div class="rule"><p class="rule-title">Zeit ' + (j + 1) + "</p>" +
+      '<div class="chips chips-days" role="group" aria-label="Wochentage, Zeit ' + (j + 1) + '">' + days + "</div>" +
+      '<div class="preset-row">' + [["all", "Alle Tage"], ["week", "Mo–Fr"], ["weekend", "Sa + So"]].map(function (pr) {
+        return '<button class="btn-text" data-action="days-preset" data-idx="' + i + '" data-rule="' + j + '" data-preset="' + pr[0] + '">' + pr[1] + "</button>";
+      }).join("") + "</div>" +
+      whenEditHtml("l" + i + "-" + j, "Ausgang sperren ab", r.lock, attrs + ' data-field="lock"') +
+      whenEditHtml("u" + i + "-" + j, "Wieder freigeben um", r.unlock, attrs + ' data-field="unlock"') +
+      (c.rules.length > 1 ? '<div class="stack"><button class="btn-text btn-text-danger" data-action="remove-rule" data-idx="' + i + '" data-rule="' + j + '">Diese Zeit entfernen</button></div>' : "") +
+      "</div>";
   }
-  function viewMore() {
-    var D = S.data, sh = D.shift, mode = T.get();
-    var thisWeek = L.shiftWeekSummary(S.today, sh);
-    var html = '<div class="page"><div class="head"><h1>Mehr</h1></div>';
-    if (S.loadNote) html += '<p class="warn">' + esc(S.loadNote) + "</p>";
-    if (!S.storageOk) html += '<p class="warn">Dieses Handy erlaubt gerade kein Speichern. Änderungen gehen beim Schließen verloren.</p>';
-    // Darstellung
-    html += '<section class="section"><h2>Darstellung</h2><div class="seg" role="group" aria-label="Darstellung">' +
-      [["auto", "Automatisch"], ["light", "Hell"], ["dark", "Dunkel"]].map(function (o) {
-        return '<button class="chipbtn" data-action="theme" data-v="' + o[0] + '" aria-pressed="' + (mode === o[0]) + '">' + o[1] + "</button>";
-      }).join("") + '</div><p class="small" style="margin-top:10px">Automatisch folgt der Einstellung deines Handys. Gilt nur für dieses Handy.</p></section>';
-    // Schichtplan
-    html += '<section class="section"><h2>Schichtplan</h2><div class="switch-row"><strong>Schichten anzeigen</strong><label class="switch"><span class="sr">Schichten anzeigen</span><input type="checkbox" data-field="shift-enabled"' + (sh.enabled ? " checked" : "") + "><span></span></label></div>";
-    if (sh.enabled) {
-      html += '<div class="field"><span class="lbl" id="lbl-thisweek">Diese Woche (KW ' + L.isoWeek(S.today).week + ") ist</span><div class=\"seg\" style=\"grid-template-columns:1fr 1fr\" role=\"group\" aria-labelledby=\"lbl-thisweek\">" +
-        ["frueh", "spaet"].map(function (k) { return '<button class="chipbtn" data-action="this-week" data-v="' + k + '" aria-pressed="' + (thisWeek === k) + '">' + SHIFT_NAMES[k] + "</button>"; }).join("") +
-        '</div><p class="small">Danach wechselt es jede Woche zwischen Früh und Spät, für das ganze Jahr. ' + esc(weekPreview()) + "</p></div>";
-      html += '<div class="field"><span class="lbl" id="lbl-days">Arbeitstage</span><div class="chips" role="group" aria-labelledby="lbl-days">' +
-        [1, 2, 3, 4, 5, 6, 7].map(function (n) { return '<button class="chipbtn" data-action="toggle-day" data-v="' + n + '" aria-pressed="' + (sh.days.indexOf(n) >= 0) + '">' + L.WD_SHORT[n % 7] + "</button>"; }).join("") + "</div></div>";
-      html += '<div class="field"><span class="lbl">Frühschicht</span><div class="two"><div><label class="sr" for="t-frueh-start">Frühschicht Beginn</label><input class="input" id="t-frueh-start" type="time" data-field="time" data-k="frueh" data-p="start" value="' + sh.times.frueh.start + '"></div>' +
-        '<div><label class="sr" for="t-frueh-end">Frühschicht Ende</label><input class="input" id="t-frueh-end" type="time" data-field="time" data-k="frueh" data-p="end" value="' + sh.times.frueh.end + '"></div></div></div>' +
-        '<div class="field"><span class="lbl">Spätschicht</span><div class="two"><div><label class="sr" for="t-spaet-start">Spätschicht Beginn</label><input class="input" id="t-spaet-start" type="time" data-field="time" data-k="spaet" data-p="start" value="' + sh.times.spaet.start + '"></div>' +
-        '<div><label class="sr" for="t-spaet-end">Spätschicht Ende</label><input class="input" id="t-spaet-end" type="time" data-field="time" data-k="spaet" data-p="end" value="' + sh.times.spaet.end + '"></div></div></div>';
-      html += '<div class="switch-row"><div><strong>An Feiertagen frei</strong></div><label class="switch"><span class="sr">An Feiertagen frei</span><input type="checkbox" data-field="holidays-free"' + (sh.holidaysFree ? " checked" : "") + "><span></span></label></div>" +
-        '<p class="small">Feiertage in Berlin werden dann als „frei“ gezeigt. Einzelne Tage kannst du im Tagesdetail über „Ändern“ anpassen (Tausch, Urlaub, frei).</p>';
+
+  // Plan der Vorschau aus dem Entwurf (ohne Urlaub); null, solange etwas ungueltig ist
+  function previewPlan(c, days) {
+    var mode = L.catMode(c);
+    var rules = L.catRules(c);
+    if (mode === "none") return L.buildPlan([], [], clockNaive().slice(0, 10), days || 7, null, draftTz());
+    var ok = rules.length && rules.every(function (r) {
+      return L.isWhen(r.lock) && L.isWhen(r.unlock) && L.canonWhen(r.lock) !== L.canonWhen(r.unlock) && r.days.length;
+    });
+    var loc = L.normalizeLocation(S.draft.location);
+    if (!ok || (L.usesSun(rules) && !loc)) return null;
+    try {
+      return L.buildPlan(rules, [], clockNaive().slice(0, 10), days || 7, loc, draftTz());
+    } catch (e) { return null; }
+  }
+
+  function previewHtml(c, naive) {
+    var mode = L.catMode(c);
+    if (mode === "none") {
+      return '<p class="muted small">Die Klappe ist nach Zeitplan immer frei. Sonderregeln, Urlaub und „Alle drinnen lassen“ gelten trotzdem.</p>';
     }
-    html += "</section>";
-    // Geburtstage
-    var imp = D.birthdays.filter(function (b) { return b.source === "import"; }).length, man = D.birthdays.length - imp;
-    html += '<section class="section"><h2>Geburtstage</h2><p>' + (D.birthdays.length ? imp + " aus dem Import, " + man + " von Hand." : "Noch keine Geburtstage.") + "</p>" +
-      '<details class="help"><summary>So bekommst du die Geburtstage aus Google</summary><ol>' +
-      "<li>Öffne <strong>contacts.google.com</strong> im Browser und melde dich an. Am Handy: im Chrome-Menü „Desktop-Version“ einschalten.</li>" +
-      "<li>Links auf <strong>Exportieren</strong> tippen.</li><li>Alle Kontakte wählen und als <strong>vCard</strong> oder <strong>Google CSV</strong> exportieren.</li>" +
-      "<li>Die Datei landet in den Downloads. Hier unten „Datei wählen“ tippen und sie auswählen.</li></ol></details>" +
-      '<label class="btn wide file-btn" style="margin-bottom:10px"><span>Datei wählen (vCard oder CSV)</span><input type="file" data-field="import-contacts" accept=".vcf,.csv,text/vcard,text/x-vcard,text/csv,text/plain" aria-label="Kontakte-Datei wählen"></label>' +
-      '<button class="btn ghost wide" data-action="add-birthday">Geburtstag von Hand eintragen</button>';
-    if (D.birthdays.length) {
-      var sorted = D.birthdays.slice().sort(function (a, b) { return a.month - b.month || a.day - b.day || a.name.localeCompare(b.name, "de"); });
-      html += '<details class="help" style="margin-top:12px"><summary>Alle ' + D.birthdays.length + " Geburtstage ansehen</summary><ul class=\"list\">" + sorted.map(function (b) {
-        return "<li><div><strong>" + esc(b.name) + "</strong><small>" + b.day + ". " + monthName(b.month) + (b.year ? " " + b.year : "") + "</small></div>" +
-          '<button class="small-btn" data-action="del-birthday" data-id="' + esc(b.id) + '" aria-label="' + esc(b.name) + ' löschen">Löschen</button></li>';
-      }).join("") + "</ul></details>";
+    var plan = previewPlan(c, 7);
+    if (!plan) return '<p class="muted small">Die Vorschau erscheint, sobald alle Zeiten gültig sind' +
+      (L.usesSun(L.catRules(c)) && !L.normalizeLocation(S.draft.location) ? " und der Standort eingestellt ist" : "") + ".</p>";
+    var today = naive.slice(0, 10);
+    if (mode === "daily") {
+      var simple = L.isHHMM(c.lock) && L.isHHMM(c.unlock) ? [c.lock, c.unlock] : null;
+      return barHtml(L.planSegments(plan, today), L.nowPercent(naive), L.planCaption(plan, today, simple), true);
     }
-    html += "</section>";
-    // Vorlagen
-    html += '<section class="section"><h2>Vorlagen</h2><p>Typische Termine, die du beim Anlegen mit einem Tipp übernimmst. Speichern kannst du sie im Termin über „Als Vorlage speichern“.</p>';
-    if (D.templates.length) html += '<ul class="list">' + D.templates.map(function (t) {
-      return "<li><div><strong>" + esc(t.title) + "</strong><small>" + esc(t.time ? t.time + (t.endTime ? "–" + t.endTime : "") : "ganztägig") + (t.repeat !== "none" ? " · " + L.REPEATS[t.repeat].toLowerCase() : "") + "</small></div>" +
-        '<button class="small-btn" data-action="del-template" data-id="' + esc(t.id) + '" aria-label="Vorlage ' + esc(t.title) + ' löschen">Löschen</button></li>';
-    }).join("") + "</ul>"; else html += '<p class="small">Noch keine Vorlagen.</p>';
-    html += "</section>";
-    // Daten
-    html += '<section class="section"><h2>Sicherung</h2><p>Deine Daten liegen nur auf diesem Handy. Mit einer Sicherungsdatei kannst du sie aufbewahren oder auf ein neues Handy mitnehmen.</p>' +
-      '<button class="btn wide" data-action="export-backup" style="margin-bottom:10px">Sicherung speichern</button>' +
-      '<label class="btn ghost wide file-btn" style="margin-bottom:10px"><span>Sicherung zurückspielen</span><input type="file" data-field="import-backup" accept=".json,application/json" aria-label="Sicherungsdatei wählen"></label>' +
-      '<button class="btn danger wide" data-action="wipe">Alle Daten löschen</button></section>';
-    html += '<p class="version">Kalender ' + VERSION + "</p></div>";
+    var rows = "";
+    for (var d = 0; d < 7; d++) {
+      var day = L.addDays(today + "T00:00", d).slice(0, 10);
+      rows += '<div class="wp-row"><span class="wp-day">' + (d === 0 ? "Heute" : L.DAY_ABBR[L.weekdayOf(day)]) + "</span>" +
+        barHtml(L.planSegments(plan, day), d === 0 ? L.nowPercent(naive) : null, "") + "</div>";
+    }
+    rows += '<div class="wp-axis"><span></span>' + ticksHtml() + "</div>";
+    return '<div class="wp" role="img" aria-label="Wochenübersicht der Sperrzeiten">' + rows + "</div>" +
+      '<p class="bar-caption">' + esc(L.planCaption(plan, today)) + "</p>";
+  }
+
+  function catEditHtml(c, i, naive) {
+    var mode = L.catMode(c), body = "";
+    if (mode === "daily") {
+      var attrs = 'data-idx="' + i + '"';
+      body = whenEditHtml("l" + i, "Ausgang sperren ab", c.lock, attrs + ' data-field="lock"') +
+        whenEditHtml("u" + i, "Wieder freigeben um", c.unlock, attrs + ' data-field="unlock"');
+    } else if (mode === "weekly") {
+      body = c.rules.map(function (r, j) { return ruleHtml(c, i, r, j); }).join("") +
+        (c.rules.length < L.MAX_RULES ? '<div class="stack"><button class="btn btn-quiet" data-action="add-rule" data-idx="' + i + '">Weitere Zeit hinzufügen</button></div>' : "");
+    }
+    return '<section class="cat-edit">' +
+      '<label class="sr" for="n' + i + '">Name des Tiers</label>' +
+      '<div class="edit-head">' + faceHtml(c.name.trim(), false, "face-sm") +
+      '<input class="name-input" id="n' + i + '" data-field="name" data-idx="' + i + '" value="' + esc(c.name) + '" placeholder="Name" autocomplete="off" autocapitalize="words" spellcheck="false"></div>' +
+      '<p class="name-hint">Genau so geschrieben wie in der Sure-App.</p>' +
+      modeSwitchHtml(c, i) + body +
+      '<div class="preview" data-preview="' + i + '">' + previewHtml(c, naive) + "</div>" +
+      '<div class="stack"><button class="btn-text btn-text-danger" data-action="remove-cat" data-idx="' + i + '">Tier entfernen</button></div>' +
+      "</section>";
+  }
+
+  /* ----- Standort ----- */
+
+  function locationKey(loc) {
+    if (!loc) return "none";
+    for (var i = 0; i < CITIES.length; i++) {
+      if (loc.label === CITIES[i][0] && Math.abs(loc.lat - CITIES[i][1]) < 0.0005 && Math.abs(loc.lon - CITIES[i][2]) < 0.0005) return "c" + i;
+    }
+    return loc.label === "Mein Standort" ? "gps" : "custom";
+  }
+
+  function sunLineHtml() {
+    var loc = L.normalizeLocation(S.draft.location);
+    if (!loc) return "";
+    var t = L.sunTimes(clockNaive().slice(0, 10), loc.lat, loc.lon, draftTz());
+    if (!t[0] || !t[1]) return '<p class="muted small">An diesem Ort geht die Sonne heute nicht auf oder unter.</p>';
+    return '<p class="muted small" id="sun-line">Heute: Sonnenaufgang ' + esc(L.timeOf(t[0])) + " Uhr, Sonnenuntergang " + esc(L.timeOf(t[1])) + " Uhr.</p>";
+  }
+
+  function locationEditHtml() {
+    var loc = S.draft.location, key = locationKey(loc);
+    var used = S.draft.cats.some(function (c) { return L.usesSun(L.catRules(c)); });
+    var opts = [["none", "Kein Standort"]].concat(CITIES.map(function (c, i) { return ["c" + i, c[0]]; }))
+      .concat([["gps", "Mein Standort (GPS)"], ["custom", "Eigene Koordinaten"]]);
+    var html = '<section class="section"><h2>Standort</h2>' +
+      "<p>Nur nötig, wenn eine Zeit „Sonnenuntergang“ oder „Sonnenaufgang“ heißt." + (used ? "" : " Im Moment nutzt kein Tier das.") + "</p>" +
+      '<div class="sel-row"><label for="loc-city">Ort</label><select class="select select-wide" id="loc-city" data-loc="city">' +
+      opts.map(function (o) { return '<option value="' + o[0] + '"' + (o[0] === key ? " selected" : "") + ">" + esc(o[1]) + "</option>"; }).join("") + "</select></div>";
+    if (key === "custom") {
+      html += '<div class="time-row"><label for="loc-lat">Breite (Nord)</label><input class="time-input num-input" type="number" step="0.0001" min="-90" max="90" inputmode="decimal" id="loc-lat" data-locfield="lat" value="' + esc(loc.lat) + '"></div>' +
+        '<div class="time-row"><label for="loc-lon">Länge (Ost)</label><input class="time-input num-input" type="number" step="0.0001" min="-180" max="180" inputmode="decimal" id="loc-lon" data-locfield="lon" value="' + esc(loc.lon) + '"></div>';
+    } else if (key === "gps") {
+      html += '<p class="muted small">Auf etwa einen Kilometer gerundet: ' + esc(String(loc.lat).replace(".", ",") + " / " + String(loc.lon).replace(".", ",")) + ".</p>";
+    }
+    html += '<div class="stack"><button class="btn btn-quiet" data-action="geolocate">Meinen Standort verwenden</button></div>' +
+      '<div id="sun-wrap">' + sunLineHtml() + "</div></section>";
     return html;
   }
 
-  function navHtml() {
-    var items = [["month", "Monat", I.month], ["year", "Jahr", I.year], ["agenda", "Termine", I.list], ["more", "Mehr", I.more]];
-    return '<nav class="nav" aria-label="Hauptmenü">' + items.map(function (it) {
-      return '<button data-action="tab" data-tab="' + it[0] + '"' + (S.tab === it[0] ? ' aria-current="page"' : "") + (S.tab === it[0] ? "" : "") + ">" + it[2] + "<span>" + it[1] + "</span></button>";
-    }).join("") + "</nav>";
+  /* ----- Urlaub und Ausnahmen ----- */
+
+  function fmtDate(iso, withYear) {
+    var p = iso.split("-");
+    return p[2] + "." + p[1] + "." + (withYear ? p[0] : "");
+  }
+  function vacRange(v, today) {
+    var y = today.slice(0, 4), many = v.from.slice(0, 4) !== y || v.to.slice(0, 4) !== y;
+    return v.from === v.to ? fmtDate(v.from, many) : fmtDate(v.from, many) + " – " + fmtDate(v.to, many);
+  }
+  function vacWho(v) { return v.cats && v.cats.length ? v.cats.join(", ") : "Alle Tiere"; }
+  function vacWhat(v) { return v.state === "free" ? "draußen erlaubt" : "drinnen bleiben"; }
+
+  function newVacForm() {
+    return { from: "", to: "", state: "locked", cats: [], note: "" };
   }
 
-  function render() {
-    var body = S.tab === "year" ? viewYear() : S.tab === "agenda" ? viewAgenda() : S.tab === "more" ? viewMore() : viewMonth();
-    var scroll = window.scrollY;
-    $app.innerHTML = body + navHtml();
-    if (S.keepScroll) window.scrollTo(0, scroll); else window.scrollTo(0, 0);
-    S.keepScroll = false;
-  }
-  function rerender() { S.keepScroll = true; render(); }
-
-  /* ---------- Fenster ---------- */
-  function openSheet(html, focusSel) {
-    closeSheet(true);
-    S.lastFocus = document.activeElement;
-    var root = document.createElement("div");
-    root.id = "sheet-root"; root.className = "scrim"; root.setAttribute("data-action", "scrim");
-    root.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">' + html + "</div>";
-    document.body.appendChild(root);
-    $app.inert = true; $app.setAttribute("aria-hidden", "true");
-    S.sheetOpen = true;
-    var f = focusSel ? $(focusSel, root) : null;
-    (f || $("input, button, select, textarea", root) || root).focus();
-  }
-  function closeSheet(silent) {
-    var root = document.getElementById("sheet-root");
-    if (root) root.remove();
-    $app.inert = false; $app.removeAttribute("aria-hidden");
-    S.sheetOpen = false;
-    if (!silent && S.lastFocus && document.contains(S.lastFocus)) { try { S.lastFocus.focus(); } catch (e) { /* egal */ } }
-  }
-  function sheetVal(id) { var el = document.getElementById(id); return el ? el.value : ""; }
-  function sheetErr(text) { var e = document.getElementById("sheet-err"); if (e) e.textContent = text; }
-
-  function confirmSheet(opts) {
-    S.confirmCb = opts.onOk;
-    openSheet('<h2 id="sheet-title">' + esc(opts.title) + "</h2><p style=\"margin-bottom:14px;color:var(--ink-2)\">" + esc(opts.text) + '</p><div class="actions">' +
-      '<button class="btn' + (opts.danger ? " danger" : "") + '" data-action="confirm-ok">' + esc(opts.ok) + '</button><button class="btn ghost" data-action="close-sheet">Abbrechen</button></div>', '[data-action="close-sheet"]');
-  }
-
-  function eventSheet(id, date) {
-    var ev = id ? S.data.events.filter(function (e) { return e.id === id; })[0] : null;
-    var e = ev || { title: "", date: date, time: "09:00", endTime: "", notes: "", repeat: "none", until: "" };
-    var allday = !e.time;
-    var html = '<h2 id="sheet-title">' + (ev ? "Termin ändern" : "Neuer Termin") + "</h2>";
-    if (!ev && S.data.templates.length) {
-      html += '<div class="field"><span class="lbl">Vorlage verwenden</span><div class="chips">' + S.data.templates.map(function (t) {
-        return '<button class="chipbtn" data-action="use-template" data-id="' + esc(t.id) + '">' + esc(t.title) + "</button>";
-      }).join("") + "</div></div>";
+  function vacationEditHtml() {
+    var today = clockNaive().slice(0, 10);
+    var list = (S.draft.vacations || []).slice().sort(function (a, b) { return a.from < b.from ? -1 : a.from > b.from ? 1 : 0; });
+    var f = S.vacForm || (S.vacForm = newVacForm());
+    var html = '<section class="section"><h2>Urlaub und Ausnahmen</h2>' +
+      "<p>Für ganze Tage: Die Tiere bleiben drinnen oder dürfen den ganzen Tag raus, egal was der Wochenplan sagt.</p>";
+    if (list.length) {
+      html += '<ul class="vac-list">' + list.map(function (v) {
+        var idx = S.draft.vacations.indexOf(v), active = v.from <= today && today <= v.to;
+        return '<li class="vac"><div><strong>' + esc(vacRange(v, today)) + "</strong>" + (active ? ' <span class="badge">läuft</span>' : "") +
+          "<span>" + esc(vacWho(v) + ": " + vacWhat(v)) + "</span>" + (v.note ? "<small>" + esc(v.note) + "</small>" : "") + "</div>" +
+          '<button class="btn-text btn-text-danger" data-action="remove-vac" data-idx="' + idx + '" aria-label="Eintrag ' + esc(vacRange(v, today)) + ' entfernen">Entfernen</button></li>';
+      }).join("") + "</ul>";
+    } else {
+      html += '<p class="muted small">Noch nichts eingetragen.</p>';
     }
-    html += '<div class="field"><label for="ev-title">Titel</label><input class="input" id="ev-title" maxlength="120" autocomplete="off" value="' + esc(e.title) + '"></div>' +
-      '<div class="field"><label for="ev-date">Datum</label><input class="input" id="ev-date" type="date" value="' + e.date + '"></div>' +
-      '<label class="check"><input type="checkbox" id="ev-allday"' + (allday ? " checked" : "") + '> Ganztägig</label>' +
-      '<div class="two field" id="ev-times"' + (allday ? " hidden" : "") + '><div><label for="ev-time" style="font-size:14px;font-weight:600;color:var(--ink-2)">Beginn</label><input class="input" id="ev-time" type="time" value="' + (e.time || "09:00") + '"></div>' +
-      '<div><label for="ev-end" style="font-size:14px;font-weight:600;color:var(--ink-2)">Ende (optional)</label><input class="input" id="ev-end" type="time" value="' + (e.endTime || "") + '"></div></div>' +
-      '<div class="field" style="margin-top:8px"><label for="ev-repeat">Wiederholen</label><select class="select" id="ev-repeat">' + Object.keys(L.REPEATS).map(function (k) { return '<option value="' + k + '"' + (e.repeat === k ? " selected" : "") + ">" + L.REPEATS[k] + "</option>"; }).join("") + "</select></div>" +
-      '<div class="field" id="ev-until-wrap"' + (e.repeat === "none" ? " hidden" : "") + '><label for="ev-until">Wiederholen bis (optional)</label><input class="input" id="ev-until" type="date" value="' + (e.until || "") + '"></div>' +
-      '<div class="field"><label for="ev-notes">Notizen</label><textarea class="textarea" id="ev-notes" maxlength="4000">' + esc(e.notes) + "</textarea></div>" +
-      '<p class="err" id="sheet-err" role="alert"></p><div class="actions"><button class="btn" data-action="save-event" data-id="' + (ev ? esc(ev.id) : "") + '">Speichern</button>' +
-      '<button class="btn ghost" data-action="save-template">Als Vorlage speichern</button>' +
-      (ev ? '<button class="btn danger" data-action="delete-event" data-id="' + esc(ev.id) + '">' + (ev.repeat !== "none" ? "Ganze Serie löschen" : "Löschen") + "</button>" : "") +
-      '<button class="btn ghost" data-action="close-sheet">Abbrechen</button></div>';
-    openSheet(html, "#ev-title");
+    html += '<div class="vac-form"><h3 class="mini-title">Neu eintragen</h3>' +
+      '<div class="time-row"><label for="vac-from">Von</label><input class="time-input date-input" type="date" id="vac-from" data-vac="from" min="' + today + '" value="' + esc(f.from) + '"></div>' +
+      '<div class="time-row"><label for="vac-to">Bis (einschließlich)</label><input class="time-input date-input" type="date" id="vac-to" data-vac="to" min="' + esc(f.from || today) + '" value="' + esc(f.to) + '"></div>' +
+      '<p class="form-label" id="vac-who-l">Für wen</p><div class="chips" role="group" aria-labelledby="vac-who-l">' +
+      '<button class="chip" data-action="vac-cat" data-name="" aria-pressed="' + (f.cats.length === 0) + '">Alle</button>' +
+      S.draft.cats.filter(function (c) { return c.name.trim(); }).map(function (c) {
+        return '<button class="chip" data-action="vac-cat" data-name="' + esc(c.name.trim()) + '" aria-pressed="' + (f.cats.indexOf(c.name.trim()) >= 0) + '">' + esc(c.name.trim()) + "</button>";
+      }).join("") + "</div>" +
+      '<p class="form-label" id="vac-what-l">Was gilt</p><div class="seg" role="group" aria-labelledby="vac-what-l">' +
+      '<button class="seg-btn" data-action="vac-state" data-state="locked" aria-pressed="' + (f.state === "locked") + '">Drinnen bleiben</button>' +
+      '<button class="seg-btn" data-action="vac-state" data-state="free" aria-pressed="' + (f.state === "free") + '">Draußen erlaubt</button></div>' +
+      '<div class="field"><label for="vac-note">Notiz (freiwillig)</label><input class="input" id="vac-note" data-vac="note" maxlength="80" value="' + esc(f.note) + '" placeholder="z. B. Besuch, Tierarzt" autocomplete="off"></div>' +
+      '<div class="stack"><button class="btn btn-quiet" data-action="add-vac">Eintragen</button></div>' +
+      (S.vacError ? '<p class="err" role="alert">' + esc(S.vacError) + "</p>" : "") + "</div></section>";
+    return html;
   }
-  function readEventForm() {
-    var allday = document.getElementById("ev-allday").checked;
-    return {
-      title: sheetVal("ev-title"), date: sheetVal("ev-date"), time: allday ? "" : sheetVal("ev-time"), endTime: allday ? "" : sheetVal("ev-end"),
-      repeat: sheetVal("ev-repeat"), until: sheetVal("ev-until"), notes: sheetVal("ev-notes")
+
+  function alertSelectHtml(key, label) {
+    var a = S.draft.alerts;
+    return '<div class="sel-row"><label for="a-' + key + '">' + esc(label) + '</label>' +
+      '<select class="select" id="a-' + key + '" data-alert="' + key + '"' + (a.enabled ? "" : " disabled") + ">" +
+      L.alertChoices(key, a[key]).map(function (o) {
+        return '<option value="' + o.value + '"' + (o.selected ? " selected" : "") + ">" + esc(o.label) + "</option>";
+      }).join("") + "</select></div>";
+  }
+
+  function alertsEditHtml() {
+    var a = S.draft.alerts;
+    return '<section class="section"><h2>Warnungen</h2>' +
+      "<p>Meldungen aufs Handy und Hinweise in der App, wenn etwas nicht stimmt.</p>" +
+      '<div class="switch-row switch-flush"><div><strong>Warnungen aktiv</strong></div>' +
+      '<label class="switch"><span class="sr">Warnungen aktiv</span><input type="checkbox" id="a-enabled" data-alert="enabled"' + (a.enabled ? " checked" : "") + "><span></span></label></div>" +
+      alertSelectHtml("outside_after_lock_min", "Noch draußen, obwohl gesperrt, nach") +
+      alertSelectHtml("outside_long_hours", "Sehr lange draußen ab") +
+      alertSelectHtml("battery_percent", "Batterie schwach ab") +
+      '<p class="muted small">Bei „Aus“ gibt es diese Warnung nicht. Dass die Klappe oder der Hub offline ist, wird immer gemeldet.</p></section>';
+  }
+
+  async function loadSchedule() {
+    if (S.scheduleLoaded || S.scheduleLoading) return;
+    S.scheduleLoading = true;
+    try {
+      var raw = await S.api.getSchedule();
+      if (!raw && S.status) {
+        raw = {
+          enabled: !S.status.paused, timezone: S.status.timezone,
+          lead_minutes: S.status.lead_minutes, alerts: S.status.alerts,
+          location: S.status.location || null, vacations: S.status.vacations || [],
+          cats: (S.status.cats || []).map(function (c) {
+            return c.lock && c.unlock ? { name: c.name, lock: c.lock, unlock: c.unlock }
+              : { name: c.name, rules: c.rules || [] };
+          })
+        };
+      }
+      S.saved = L.normalizeSchedule(raw);
+      S.saved.vacations = L.pruneVacations(S.saved.vacations, clockNaive());
+      S.draft = clone(S.saved);
+      S.vacForm = null; S.vacError = "";
+      S.scheduleLoaded = true; S.scheduleError = null;
+    } catch (e) {
+      S.scheduleError = e;
+    }
+    S.scheduleLoading = false;
+    if (S.tab === "times") render();
+  }
+
+  function viewTimes() {
+    var html = '<h1 class="page-title">Zeiten</h1>';
+    if (!S.scheduleLoaded) {
+      loadSchedule();
+      return html + (S.scheduleError
+        ? noteHtml("bad", "Die Zeiten konnten nicht geladen werden.", [L.errorText(S.scheduleError)],
+            '<button class="note-btn" data-action="retry-times">Nochmal versuchen</button>')
+        : loadingCardHtml());
+    }
+    var naive = clockNaive();
+    html += '<div id="times-status">' + timesStatusHtml() + "</div>";
+    S.draft.cats.forEach(function (c, i) { html += catEditHtml(c, i, naive); });
+    html += '<div class="stack"><button class="btn btn-quiet btn-wide" data-action="add-cat">Tier hinzufügen</button></div>';
+    html += vacationEditHtml();
+    html += locationEditHtml();
+    html += alertsEditHtml();
+    html += '<div class="switch-row" style="margin-top:20px"><div><strong>Zeitplan aktiv</strong><p>Ausgeschaltet bleibt die Klappe, wie sie ist (z. B. beim Tierarzt).</p></div>' +
+      '<label class="switch"><span class="sr">Zeitplan aktiv</span><input type="checkbox" data-field="enabled"' + (S.draft.enabled ? " checked" : "") + "><span></span></label></div>";
+    html += '<div class="savebar" id="savebar">' + saveBarHtml() + "</div>";
+    return html;
+  }
+
+  /* ----- Mehr ----- */
+
+  function diagHtml() {
+    if (S.diagBusy) return '<p style="margin-top:12px">Wird geprüft …</p>';
+    if (!S.diag) return "";
+    return '<ul class="diag">' + S.diag.map(function (d) {
+      return "<li>" + (d.ok ? '<span class="ok">' + I.ok + "</span>" : '<span class="no">' + I.no + "</span>") +
+        "<span>" + esc(d.label) + (d.ok ? (d.detail ? "<small>" + esc(d.detail) + "</small>" : "")
+          : "<small>" + esc(d.detail) + (d.hint ? " " + esc(d.hint) : "") + "</small>") + "</span></li>";
+    }).join("") + "</ul>";
+  }
+
+  var THEME_CHOICES = [["auto", "Automatisch"], ["system", "Wie das Handy"], ["day", "Immer Tag"], ["night", "Immer Nacht"]];
+
+  function looksHtml() {
+    var mode = window.KLTheme && window.KLTheme.getMode ? window.KLTheme.getMode() : "auto";
+    var names = allPetNames().sort(function (a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1; });
+    var curPal = window.KLTheme && window.KLTheme.getPalette ? window.KLTheme.getPalette() : "sonne";
+    var palHtml = window.KLTheme && window.KLTheme.PALETTES ? '<p class="form-label" id="pal-label">Farbschema</p><ul class="pal-grid" role="group" aria-labelledby="pal-label">' +
+      window.KLTheme.PALETTES.map(function (p) {
+        return '<li><button class="pal-btn" data-action="palette" data-id="' + p.id + '" aria-pressed="' + (p.id === curPal) + '" aria-label="Farbschema ' + esc(p.name) + '">' +
+          '<span class="pal-sw" style="--d:' + p.day + ';--n:' + p.night + '"></span><span>' + esc(p.name) + "</span></button></li>";
+      }).join("") + "</ul>" : "";
+    var curStyle = window.KLTheme && window.KLTheme.getStyle ? window.KLTheme.getStyle() : "cartoon";
+    var curMotion = window.KLTheme && window.KLTheme.getMotion ? window.KLTheme.getMotion() : "auto";
+    var styleHtml = window.KLTheme && window.KLTheme.STYLES ? '<p class="form-label" id="style-label">Stil</p><ul class="pal-grid pal-grid-2" role="group" aria-labelledby="style-label">' +
+      [["cartoon", "Cartoon", "Dicke Konturen"], ["modern", "Modern", "Weich und ruhig"]].map(function (s) {
+        return '<li><button class="pal-btn style-btn" data-action="style" data-id="' + s[0] + '" aria-pressed="' + (s[0] === curStyle) + '" aria-label="Stil ' + s[1] + '">' +
+          '<span class="style-prev" data-style-prev="' + s[0] + '" aria-hidden="true"></span><strong>' + s[1] + "</strong><small>" + s[2] + "</small></button></li>";
+      }).join("") + "</ul>" : "";
+    var motionHtml = window.KLTheme && window.KLTheme.MOTIONS ? '<div class="sel-row"><label for="motion-mode">Animationen</label><select class="select select-wide" id="motion-mode" data-motion-mode="1">' +
+      [["auto", "Wie das Handy"], ["on", "Immer an"], ["off", "Aus"]].map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === curMotion ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") +
+      '</select></div><p class="gauge-sub">Blinzelnde Augen, schlafende Katzen und laufende Pfoten. „Wie das Handy“ schaltet sie aus, wenn am Handy „Animationen reduzieren“ an ist.</p>' : "";
+    var html = '<section class="section"><h2>Aussehen</h2>' +
+      "<p>Automatisch heißt: hell am Tag, dunkel in der Nacht (nach Sonnenauf- und -untergang, wenn unter „Zeiten“ ein Standort eingestellt ist). Alles hier gilt nur für dieses Handy.</p>" +
+      '<div class="sel-row"><label for="theme-mode">Farbwelt</label><select class="select select-wide" id="theme-mode" data-theme-mode="1">' +
+      THEME_CHOICES.map(function (c) { return '<option value="' + c[0] + '"' + (c[0] === mode ? " selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select></div>" + palHtml + styleHtml + motionHtml;
+    if (names.length) {
+      html += '<p class="form-label">Fellfarben</p><ul class="look-list">' + names.map(function (n) {
+        var lk = lookOf(n);
+        return '<li class="look-row">' + faceHtml(n, false, "face-sm") + "<strong>" + esc(n) + "</strong>" +
+          '<button class="btn-text" data-action="look-open" data-name="' + esc(n) + '" aria-label="Aussehen von ' + esc(n) + ' ändern">' + esc(L.coatName(lk.coat)) + " ändern</button></li>";
+      }).join("") + "</ul>";
+    }
+    if (canBuzz()) {
+      html += '<div class="switch-row switch-flush"><div><strong>Kurzes Vibrieren beim Tippen</strong></div>' +
+        '<label class="switch"><span class="sr">Kurzes Vibrieren beim Tippen</span><input type="checkbox" id="haptics" data-haptics="1"' + (S.haptics ? " checked" : "") + "><span></span></label></div>";
+    }
+    return html + "</section>";
+  }
+
+  function viewMore() {
+    var html = '<h1 class="page-title">Mehr</h1>';
+    if (S.demo) {
+      html += noteHtml("info", "Das ist die Demo.", ["Nichts davon ist echt. Es wird keine Klappe geschaltet."],
+        '<button class="note-btn" data-action="logout">Demo beenden</button>');
+    }
+    html += '<section class="section"><h2>Verbindung</h2>' +
+      "<p>" + (S.demo ? "Demo ohne Verbindung." : "Verbunden mit " + esc(S.cfg.owner + "/" + S.cfg.repo) + ".") + "</p>" +
+      '<div class="stack"><button class="btn btn-quiet" data-action="diag">Verbindung testen</button>' +
+      (S.demo ? "" : '<button class="btn btn-quiet" data-action="run-now">Zeitplan jetzt ausführen</button>') + "</div>" +
+      diagHtml() + "</section>";
+    html += looksHtml();
+    html += lockHtml();
+    if (!S.demo) {
+      html += '<section class="section"><h2>Zweite Person einladen</h2>' +
+        "<p>Der Link richtet die App auf einem anderen Handy ein, ohne dass dort etwas getippt werden muss. Er enthält den Zugangsschlüssel: nur an Personen schicken, denen du vertraust.</p>" +
+        '<div class="stack"><button class="btn" data-action="share">Link teilen</button>' +
+        '<button class="btn btn-quiet" data-action="copy-link">Link kopieren</button></div></section>';
+    }
+    if (!isStandalone() && !S.demo) {
+      html += '<section class="section"><h2>Als App installieren</h2>' +
+        "<p>Im Chrome-Menü (drei Punkte oben rechts) „Zum Startbildschirm hinzufügen“ wählen. Danach öffnet sich die Klappe wie jede andere App.</p>" +
+        (S.installEvt ? '<div class="stack"><button class="btn btn-quiet" data-action="install">Jetzt installieren</button></div>' : "") +
+        "</section>";
+    }
+    html += '<section class="section"><h2>So funktioniert es</h2>' +
+      '<details class="help"><summary>Was heißt „Ausgang gesperrt“?</summary><p>Das Tier kann noch hinein, aber nicht mehr hinaus. Draußen vor der Tür kommt es also immer nach Hause.</p></details>' +
+      '<details class="help"><summary>Was macht „Jetzt rauslassen“?</summary><p>Du hebst die Sperre für eine Weile auf, zum Beispiel für eine Stunde. Danach gilt wieder der Zeitplan. Eine laufende Sonderregel kannst du jederzeit beenden.</p></details>' +
+      '<details class="help"><summary>Warum dauert es etwa eine Minute?</summary><p>Die App gibt den Auftrag an einen kleinen Dienst weiter, der ihn über die Sure-Cloud an den Hub schickt. Das braucht ein bis zwei Minuten. Die App darf in der Zeit geschlossen werden.</p></details>' +
+      '<details class="help"><summary>Was, wenn ich in der Sure-App etwas ändere?</summary><p>Beim nächsten Lauf (alle 30 Minuten) stellt der Zeitplan die Klappe wieder so, wie es hier eingestellt ist. Für Ausnahmen die Sonderregeln hier benutzen. Die Zeitschaltuhr in der Sure-App am besten ausgeschaltet lassen.</p></details>' +
+      '<details class="help"><summary>Warum schaltet die Klappe manchmal ein paar Minuten früher?</summary><p>GitHub startet den Zeitplan nicht immer pünktlich, manchmal erst nach vielen Minuten. Damit trotzdem rechtzeitig gesperrt oder freigegeben wird, gilt der Zeitplan bis zu 8 Minuten früher als eingestellt.</p></details>' +
+      '<details class="help"><summary>Wie funktionieren Wochentage und Sonnenuntergang?</summary><p>Unter „Zeiten“ kannst du pro Tier „Je Wochentag“ wählen und mehrere Zeiten eintragen, zum Beispiel unter der Woche früher sperren als am Wochenende. Statt einer Uhrzeit geht auch „Sonnenuntergang“ oder „Sonnenaufgang“, auf Wunsch einige Minuten davor oder danach. Dafür braucht die App einen Standort.</p></details>' +
+      '<details class="help"><summary>Was ist „Urlaub und Ausnahmen“?</summary><p>Für ganze Tage kannst du festlegen, dass ein Tier drinnen bleibt oder den ganzen Tag raus darf. Das ersetzt dann den Wochenplan. Danach gilt er von selbst wieder.</p></details>' +
+      '<details class="help"><summary>Was macht „Alle drinnen lassen“?</summary><p>Es setzt für jedes Tier mit Zeitplan eine Sonderregel. Tiere, die keinen festen Zeitplan haben, kannst du unter „Zeiten“ mit „Kein fester Zeitplan“ aufnehmen. Dann wirkt „Alle drinnen lassen“ auch bei ihnen, sonst bleiben sie immer frei.</p></details>' +
+      '<details class="help"><summary>Was bedeuten die Warnungen?</summary><p>Die App meldet sich, wenn ein Tier trotz Sperre noch draußen ist, sehr lange draußen bleibt, die Batterie der Klappe schwächer wird oder die Klappe oder der Hub offline ist. Auf dem Handy kommt die Meldung per ntfy, in der App steht sie oben in der Übersicht. Wann gewarnt wird, stellst du unter „Zeiten“ ein.</p></details>' +
+      '<details class="help"><summary>Wie genau ist die Batterieanzeige?</summary><p>Die Klappe meldet nur ihre Spannung. Daraus wird der Prozentwert geschätzt, so wie es auch andere Programme für die Klappe machen. Er ist eine Orientierung, kein Messgerät. Bei etwa 25 Prozent solltest du neue Batterien bereitlegen.</p></details>' +
+      '<details class="help"><summary>Woher kommt der Verlauf?</summary><p>Die Sure-Cloud merkt sich jeden Durchgang an der Klappe. Der Zeitplan holt diese Einträge bei jedem Lauf ab und speichert sie drei Wochen lang. In Echtzeit ist das nicht: Ein Eintrag erscheint erst beim nächsten Lauf.</p></details>' +
+      '<details class="help"><summary>Was, wenn der Hub keinen Strom hat?</summary><p>Dann kommt kein Befehl bei der Klappe an. Die App zeigt „Hub offline“ an, sobald der Dienst das bemerkt.</p></details>' +
+      "</section>";
+    if (!S.demo) {
+      html += '<section class="section"><h2>Auf diesem Handy abmelden</h2><p>Entfernt den Zugangsschlüssel von diesem Gerät. Der Zeitplan läuft weiter.</p>' +
+        '<div class="stack"><button class="btn btn-danger" data-action="logout">Abmelden</button></div></section>';
+    }
+    html += '<p class="version">Katzenklappe ' + VERSION + "</p>";
+    return html;
+  }
+
+  /* ----- Einrichten ----- */
+
+  function viewSetup() {
+    return '<div class="welcome"><span class="hello">' + L.faceSvg({ coat: "#FFF6DC", tabby: false, muzzle: true }, false) + "</span><h1>Katzenklappe</h1>" +
+      '<p class="lead">Zeitplan für jede Katze einzeln.</p>' +
+      (S.setupError ? '<p class="err" role="alert">' + esc(S.setupError) + "</p>" : "") +
+      '<section class="section"><h2>Einrichtungs-Link einfügen</h2>' +
+      "<p>Den Link hast du per Nachricht bekommen. Wenn du ihn direkt geöffnet hast, ist hier schon alles erledigt.</p>" +
+      '<div class="field"><label for="code">Link</label><textarea class="input" id="code" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea></div>' +
+      '<div class="stack"><button class="btn btn-wide" data-action="connect-code"' + (S.setupBusy ? " disabled" : "") + ">Verbinden</button></div></section>" +
+      '<details class="help"><summary>Ich richte es zum ersten Mal ein</summary>' +
+      '<div class="field"><label for="o">GitHub-Konto</label><input class="input" id="o" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
+      '<div class="field"><label for="r">Repository</label><input class="input" id="r" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="katzenklappe"></div>' +
+      '<div class="field"><label for="t">Zugangsschlüssel</label><input class="input" id="t" type="password" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
+      '<div class="stack" style="margin-bottom:16px"><button class="btn btn-wide" data-action="connect-manual"' + (S.setupBusy ? " disabled" : "") + ">Verbinden</button></div></details>" +
+      '<div class="section"><button class="btn btn-quiet btn-wide" data-action="demo">Erst einmal die Demo ansehen</button></div></div>';
+  }
+
+  /* ----- Dialog, Meldung, Navigation ----- */
+
+  function sheetHtml() {
+    var sh = S.sheet;
+    if (!sh) return "";
+    var inner;
+    if (sh.kind === "confirm") {
+      inner = "<h2>" + esc(sh.title) + "</h2><p class=\"sheet-sub\">" + esc(sh.text) + "</p>" +
+        '<button class="opt" data-action="confirm-yes"><strong>' + esc(sh.confirmLabel) + "</strong></button>";
+    } else if (sh.kind === "pickpet") {
+      inner = "<h2>Welches Tier?</h2><p class=\"sheet-sub\">Diese Tiere kennt die Sure-Cloud, sie haben hier noch keinen Eintrag.</p>" +
+        sh.names.map(function (n, i) {
+          return '<button class="opt" data-action="choose-pet" data-idx="' + i + '"><strong>' + esc(n) + "</strong></button>";
+        }).join("") +
+        '<button class="opt" data-action="choose-pet" data-idx="-1"><strong>Anderer Name …</strong><small>Zum Eintippen</small></button>';
+    } else if (sh.kind === "look") {
+      var lk = lookOf(sh.name);
+      inner = "<h2>" + esc(sh.name) + '</h2><div class="look-preview">' + faceHtml(sh.name, false, "face-lg") +
+        "<p>" + esc(L.coatName(lk.coat)) + "</p></div>" +
+        '<div class="swatches" role="group" aria-label="Fellfarbe">' + L.COATS.map(function (c) {
+          return '<button class="swatch" data-action="look-coat" data-color="' + c.hex + '" style="--c:' + c.hex + '" aria-pressed="' + (c.hex === lk.coat) +
+            '" aria-label="' + esc(c.name) + '">' + I.ok + "</button>";
+        }).join("") + "</div>" +
+        '<div class="look-toggles"><button class="chip" data-action="look-toggle" data-prop="tabby" aria-pressed="' + lk.tabby + '">Streifen<span>' + (lk.tabby ? "an" : "aus") + "</span></button>" +
+        '<button class="chip" data-action="look-toggle" data-prop="muzzle" aria-pressed="' + lk.muzzle + '">Weiße Schnauze<span>' + (lk.muzzle ? "an" : "aus") + "</span></button></div>" +
+        '<button class="opt look-done" data-action="close-sheet"><strong>Fertig</strong></button>';
+    } else if (sh.kind === "bulk") {
+      inner = "<h2>" + (sh.wantLocked ? "Alle drinnen lassen" : "Alle rauslassen") + "</h2>" +
+        '<p class="sheet-sub">' + esc(sh.wantLocked
+          ? "Bei allen Tieren bleibt der Ausgang gesperrt. Hinein kommen sie weiterhin. Für wie lange?"
+          : "Die Klappe lässt alle Tiere raus und rein. Für wie lange?") + "</p>" +
+        sh.options.map(function (o, i) {
+          return '<button class="opt" data-action="choose-bulk" data-idx="' + i + '"><strong>' + esc(o.label) + "</strong>" +
+            (o.hint ? "<small>" + esc(o.hint) + "</small>" : "") + "</button>";
+        }).join("");
+    } else {
+      inner = "<h2>" + esc(sh.name + (sh.wantLocked ? " drinnen lassen" : " rauslassen")) + "</h2>" +
+        '<p class="sheet-sub">' + esc(sh.wantLocked
+          ? "Der Ausgang bleibt gesperrt. Hinein kommt " + sh.name + " weiterhin. Für wie lange?"
+          : "Die Klappe lässt " + sh.name + " raus und rein. Für wie lange?") + "</p>" +
+        sh.options.map(function (o, i) {
+          return '<button class="opt" data-action="choose" data-idx="' + i + '"><strong>' + esc(o.label) + "</strong>" +
+            (o.hint ? "<small>" + esc(o.hint) + "</small>" : "") + "</button>";
+        }).join("");
+    }
+    return '<div class="scrim" data-action="close-sheet"><div class="sheet" role="dialog" aria-modal="true" aria-label="Auswahl">' + inner +
+      (sh.kind === "look" ? "" : '<button class="opt opt-cancel" data-action="close-sheet"><strong>Abbrechen</strong></button>') + "</div></div>";
+  }
+
+  function toastHtml() {
+    return S.toast ? '<div class="toast" role="status">' + esc(S.toast) + "</div>" : "";
+  }
+
+  function navHtml() {
+    function item(tab, label, icon) {
+      return '<button class="nav-item" data-action="nav" data-tab="' + tab + '"' + (S.tab === tab ? ' aria-current="page"' : "") + ">" +
+        '<span class="nav-pill">' + icon + "</span>" + label + "</button>";
+    }
+    return '<nav class="nav" aria-label="Hauptmenü"><div class="nav-inner">' +
+      item("home", "Übersicht", I.home) + item("history", "Verlauf", I.list) + item("times", "Zeiten", I.clock) + item("more", "Mehr", I.more) + "</div></nav>";
+  }
+
+  function render(force) {
+    if (S.lock.locked) return; // hinter der Sperre wird nichts gezeichnet
+    var ae = document.activeElement;
+    if (!force && S.tab === "times" && ae && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && S.draft && !S.sheet) {
+      updateScheduleUi();
+      return;
+    }
+    var html;
+    if (!S.cfg) {
+      html = viewSetup();
+    } else {
+      html = (S.tab === "home" ? viewHome() : S.tab === "history" ? viewHistory() : S.tab === "times" ? viewTimes() : viewMore()) + navHtml();
+    }
+    $app.innerHTML = html + sheetHtml() + toastHtml();
+    var focus = $app.querySelector(".sheet .opt");
+    if (S.sheet && S.sheet.kind !== "look" && focus) focus.focus();
+  }
+
+  function updateScheduleUi() {
+    if (!S.draft) return;
+    var bar = document.getElementById("savebar");
+    if (bar) bar.innerHTML = saveBarHtml();
+    var st = document.getElementById("times-status");
+    if (st) st.innerHTML = timesStatusHtml();
+    var naive = clockNaive();
+    S.draft.cats.forEach(function (c, i) {
+      var el = $app.querySelector('[data-preview="' + i + '"]');
+      if (el) el.innerHTML = previewHtml(c, naive);
+    });
+    var sun = document.getElementById("sun-wrap");
+    if (sun) sun.innerHTML = sunLineHtml();
+  }
+
+  var toastTimer = null;
+  function toast(text) {
+    S.toast = text;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { S.toast = null; render(); }, 5000);
+    render();
+  }
+
+  /* ---------- Änderungen senden und abwarten ---------- */
+
+  function failedSince(runs, sinceMs) {
+    return (runs || []).some(function (r) {
+      return r.status === "completed" && r.conclusion && r.conclusion !== "success" &&
+        Date.parse(r.createdAt) >= sinceMs;
+    });
+  }
+
+  async function runAndWait(key, token, isDone, doneText) {
+    token.phase = "dispatch"; render();
+    var t0 = Date.now();
+    try {
+      await S.api.dispatch();
+    } catch (e) {
+      token.phase = "nodispatch"; token.error = e; buzz([70, 50, 70]); render();
+      return;
+    }
+    token.phase = "waiting"; render();
+    while (S.pending[key] === token) {
+      if (Date.now() - t0 > WAIT_MAX_MS) { token.phase = "slow"; buzz([70, 50, 70]); render(); return; }
+      await sleep(POLL_MS);
+      if (S.pending[key] !== token) return;
+      try {
+        var res = await fetchState(true);
+        S.error = null;
+        if (isDone(S.status)) {
+          delete S.pending[key];
+          buzz([20, 60, 20]);
+          toast(typeof doneText === "function" ? doneText(S.status) : doneText);
+          return;
+        }
+        if (failedSince(res[1], t0 - 60000)) { token.phase = "failed"; buzz([70, 50, 70]); render(); return; }
+      } catch (e) {
+        /* kurzer Netzfehler: weiter versuchen, bis die Zeit um ist */
+      }
+      render();
+    }
+  }
+
+  function overrideDone(name, wantLocked, until) {
+    return function (st) {
+      var c = catByName(st, name);
+      return !!(c && c.override && c.override.state === (wantLocked ? "locked" : "free") &&
+        c.override.until === until && c.locked === wantLocked);
     };
   }
-  function fillEventForm(t) {
-    function set(id, v) { var el = document.getElementById(id); if (el) el.value = v; }
-    set("ev-title", t.title || "");
-    set("ev-notes", t.notes || ""); set("ev-repeat", t.repeat || "none");
-    var all = !t.time; document.getElementById("ev-allday").checked = all; document.getElementById("ev-times").hidden = all;
-    set("ev-time", t.time || "09:00"); set("ev-end", t.endTime || "");
-    document.getElementById("ev-until-wrap").hidden = (t.repeat || "none") === "none";
+  function clearDone(name) {
+    return function (st) {
+      var c = catByName(st, name);
+      return !!(c && !c.override && c.locked === c.should_lock);
+    };
+  }
+  function catSummary(name) {
+    return function (st) {
+      var c = catByName(st, name);
+      return c ? name + ": " + L.describeCat(c, clockNaive(), descOpts()).headline : name;
+    };
   }
 
-  function shiftSheet(date) {
-    var D = S.data, plan = L.planShiftType(date, D.shift), cur = D.overrides[date] || "";
-    var html = '<h2 id="sheet-title">Schicht am ' + esc(L.shortDate(date)) + "</h2>";
-    html += '<button class="opt" data-action="set-shift" data-date="' + date + '" data-v="plan" aria-pressed="' + (!cur) + '"><span class="sw" style="background:var(--ink-3)"></span><div><strong>Wie geplant</strong><small>' + (plan ? SHIFT_NAMES[plan] : "Kein Dienst") + "</small></div></button>";
-    ["frueh", "spaet", "frei", "urlaub"].forEach(function (k) {
-      var t = D.shift.times[k];
-      html += '<button class="opt" data-action="set-shift" data-date="' + date + '" data-v="' + k + '" aria-pressed="' + (cur === k) + '"><span class="sw" style="background:var(--' + k + '-solid)"></span><div><strong>' + SHIFT_NAMES[k] + "</strong>" + (t ? "<small>" + t.start + " – " + t.end + " Uhr</small>" : "") + "</div></button>";
-    });
-    html += '<div class="actions"><button class="btn ghost" data-action="close-sheet">Abbrechen</button></div>';
-    openSheet(html, '.opt[aria-pressed="true"]');
+  async function changeOverride(name, wantLocked, until) {
+    var token = { phase: "saving", error: null };
+    S.pending[name] = token; render();
+    try {
+      var cur = await S.api.getOverrides();
+      var next = L.setOverride(cur, name, wantLocked ? "locked" : "free", until, clockNaive());
+      await S.api.setOverrides(next);
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait(name, token, overrideDone(name, wantLocked, until), catSummary(name));
   }
 
-  function birthdaySheet() {
-    var html = '<h2 id="sheet-title">Geburtstag eintragen</h2><div class="field"><label for="bd-name">Name</label><input class="input" id="bd-name" maxlength="100" autocomplete="off"></div>' +
-      '<div class="two field"><div><label for="bd-day" style="font-size:14px;font-weight:600;color:var(--ink-2)">Tag</label><input class="input" id="bd-day" type="number" inputmode="numeric" min="1" max="31"></div>' +
-      '<div><label for="bd-month" style="font-size:14px;font-weight:600;color:var(--ink-2)">Monat</label><select class="select" id="bd-month">' + L.MONTHS.map(function (n, i) { return '<option value="' + (i + 1) + '">' + n + "</option>"; }).join("") + "</select></div></div>" +
-      '<div class="field"><label for="bd-year">Geburtsjahr (optional, für das Alter)</label><input class="input" id="bd-year" type="number" inputmode="numeric" min="1900" max="2200"></div>' +
-      '<p class="err" id="sheet-err" role="alert"></p><div class="actions"><button class="btn" data-action="save-birthday">Speichern</button><button class="btn ghost" data-action="close-sheet">Abbrechen</button></div>';
-    openSheet(html, "#bd-name");
+  async function removeOverride(name) {
+    var token = { phase: "saving", error: null };
+    S.pending[name] = token; render();
+    try {
+      var cur = await S.api.getOverrides();
+      await S.api.setOverrides(L.clearOverride(cur, name, clockNaive()));
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait(name, token, clearDone(name), catSummary(name));
   }
 
-  /* ---------- Aktionen ---------- */
-  function saveEvent(id) {
-    var raw = readEventForm();
-    if (!raw.title.trim()) { sheetErr("Bitte einen Titel eingeben."); $("#ev-title").focus(); return; }
-    if (!L.isDate(raw.date)) { sheetErr("Bitte ein gültiges Datum wählen."); return; }
-    if (raw.time && !L.isTime(raw.time)) { sheetErr("Bitte eine gültige Uhrzeit wählen."); return; }
-    if (raw.until && raw.until < raw.date) { sheetErr("„Bis“ liegt vor dem Datum."); return; }
-    var obj = L.normalizeEvent(Object.assign({ id: id || undefined }, raw));
-    if (!obj) { sheetErr("Der Termin konnte nicht gespeichert werden."); return; }
-    if (id) S.data.events = S.data.events.map(function (e) { return e.id === id ? obj : e; }); else S.data.events.push(obj);
-    save(); closeSheet(); S.sel = obj.date;
-    S.y = +obj.date.slice(0, 4); S.m = +obj.date.slice(5, 7);
-    if (S.tab !== "agenda") S.tab = "month";
-    rerender(); toast("Termin gespeichert.");
-  }
-  function saveTemplate() {
-    var raw = readEventForm();
-    var t = L.normalizeTemplate({ title: raw.title, time: raw.time, endTime: raw.endTime, notes: raw.notes, repeat: raw.repeat });
-    if (!t) { sheetErr("Für eine Vorlage braucht es einen Titel."); return; }
-    S.data.templates = S.data.templates.filter(function (x) { return x.title.toLowerCase() !== t.title.toLowerCase(); }).concat([t]);
-    save(); sheetErr(""); toast("Vorlage „" + t.title + "“ gespeichert.");
-  }
-  function applyImport(items) {
-    var res = L.mergeImportedBirthdays(S.data.birthdays, items);
-    S.data.birthdays = res.list; save(); closeSheet(); rerender();
-    toast(res.imported + " Geburtstage importiert.");
-  }
-  function exportBackup() {
-    var text = L.backupText(S.data, new Date().toISOString());
-    var blob = new Blob([text], { type: "application/json" }), url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url; a.download = "kalender-sicherung-" + S.today + ".json";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
-    toast("Sicherung wird gespeichert (Downloads).");
-  }
-  function readFile(file, cb) {
-    if (!file) return;
-    if (file.size > 8 * 1024 * 1024) { toast("Die Datei ist zu groß."); return; }
-    var fr = new FileReader();
-    fr.onload = function () { cb(String(fr.result || ""), file.name); };
-    fr.onerror = function () { toast("Die Datei konnte nicht gelesen werden."); };
-    fr.readAsText(file);
+  function bulkDone(map, wantLocked) {
+    return function (st) {
+      return Object.keys(map).every(function (name) {
+        var c = catByName(st, name);
+        return !!(c && c.override && c.override.state === map[name].state && c.override.until === map[name].until && c.locked === wantLocked);
+      });
+    };
   }
 
-  /* ---------- Ereignisse ---------- */
-  document.addEventListener("click", function (ev) {
+  async function changeBulk(wantLocked, key) {
+    var naive = clockNaive();
+    var map = L.bulkOverrides((S.status && S.status.cats) || [], naive, wantLocked, key);
+    if (!Object.keys(map).length) {
+      toast(wantLocked ? "Alle sind ohnehin schon drinnen gesperrt." : "Alle dürfen ohnehin schon raus.");
+      return;
+    }
+    var token = { phase: "saving", error: null };
+    S.pending["__bulk"] = token; render();
+    try {
+      var cur = await S.api.getOverrides(), next = L.pruneOverrides(cur, naive);
+      Object.keys(map).forEach(function (name) { next = L.setOverride(next, name, map[name].state, map[name].until, naive); });
+      await S.api.setOverrides(next);
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait("__bulk", token, bulkDone(map, wantLocked),
+      wantLocked ? "Alle bleiben drinnen" : "Alle dürfen raus");
+  }
+
+  async function clearAllOverrides() {
+    var token = { phase: "saving", error: null };
+    S.pending["__bulk"] = token; render();
+    try {
+      await S.api.setOverrides({});
+    } catch (e) {
+      token.phase = "error"; token.error = e; render();
+      return;
+    }
+    await runAndWait("__bulk", token, function (st) {
+      return (st.cats || []).every(function (c) { return !c.override && c.locked === c.should_lock; });
+    }, "Der Zeitplan gilt wieder für alle");
+  }
+
+  function scheduleDone(draft) {
+    return function (st) {
+      if (!st || st.config_ok === false) return false;
+      if (!!st.paused !== !draft.enabled) return false;
+      if (st.alerts && !L.sameAlerts(st.alerts, draft.alerts)) return false;
+      var cats = st.cats || [];
+      if (cats.length !== draft.cats.length) return false;
+      var catsOk = draft.cats.every(function (d) {
+        var c = catByName(st, d.name.trim());
+        if (!c) return false;
+        if (c.rules) return L.sameRules(c.rules, L.catRules(d));   // Dienst mit Wochenplan: Regeln vergleichen
+        return !Array.isArray(d.rules) && c.lock === d.lock && c.unlock === d.unlock;
+      });
+      if (!catsOk) return false;
+      if (st.vacations !== undefined) {
+        var key = function (v) { return JSON.stringify([v.id, v.from, v.to, v.state, (v.cats || []).join("|"), v.note || ""]); };
+        var want = L.pruneVacations(L.normalizeVacations(draft.vacations), clockNaive()).map(key).sort();
+        if (JSON.stringify(want) !== JSON.stringify((st.vacations || []).map(key).sort())) return false;
+      }
+      if (st.location !== undefined) {
+        var loc = L.normalizeLocation(draft.location);
+        if (JSON.stringify(st.location || null) !== JSON.stringify(loc ? { lat: loc.lat, lon: loc.lon } : null)) return false;
+      }
+      return true;
+    };
+  }
+
+  async function saveTimes() {
+    var errors = L.validateSchedule(S.draft);
+    if (errors.length) return;
+    var snapshot = clone(S.draft);
+    var token = { phase: "saving", error: null };
+    S.pending["__schedule"] = token; render(true);
+    try {
+      await S.api.setSchedule(L.serializeSchedule(snapshot));
+      S.saved = clone(snapshot);
+    } catch (e) {
+      token.phase = "error"; token.error = e; render(true);
+      return;
+    }
+    render(true);
+    await runAndWait("__schedule", token, scheduleDone(snapshot), "Zeiten gespeichert und übernommen");
+    if (S.tab === "times") render(true);
+  }
+
+  async function runNow() {
+    var token = { phase: "dispatch", error: null };
+    S.pending["__run"] = token; render();
+    try {
+      await S.api.dispatch();
+    } catch (e) {
+      delete S.pending["__run"];
+      toast(L.errorText(e));
+      return;
+    }
+    delete S.pending["__run"];
+    toast("Zeitplan gestartet. In etwa einer Minute ist der neue Stand da.");
+    for (var i = 0; i < 20; i++) {
+      await sleep(POLL_MS * 2);
+      try { await fetchState(); render(); } catch (e) { /* weiter */ }
+      var r = newestRun();
+      if (r && r.status === "completed" && Date.parse(r.createdAt) > Date.now() - 600000) break;
+    }
+  }
+
+  /* ---------- Eingaben ---------- */
+
+  function shareLink() {
+    var base = location.origin + location.pathname;
+    return base + "#setup=" + L.encodeSetup(S.cfg);
+  }
+
+  async function share() {
+    var link = shareLink();
+    var text = "Katzenklappe: Diesen Link auf dem Handy öffnen, dann ist die App eingerichtet. Danach im Chrome-Menü „Zum Startbildschirm hinzufügen“ wählen.";
+    if (navigator.share) {
+      try { await navigator.share({ title: "Katzenklappe", text: text, url: link }); return; }
+      catch (e) { if (e && e.name === "AbortError") return; }
+    }
+    copyLink();
+  }
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(shareLink());
+      toast("Link kopiert. Jetzt in einer Nachricht einfügen.");
+    } catch (e) {
+      toast("Kopieren hat nicht geklappt.");
+    }
+  }
+
+  async function runDiag() {
+    S.diagBusy = true; S.diag = null; render();
+    try { S.diag = await S.api.diagnose(); } catch (e) { S.diag = [{ label: "Prüfung", ok: false, detail: L.errorText(e) }]; }
+    S.diagBusy = false; render();
+  }
+
+  function addCatNamed(name) {
+    S.draft.cats.push({ name: name, lock: "22:00", unlock: "06:30" });
+    render(true);
+    var inputs = $app.querySelectorAll(".name-input");
+    var last = inputs[inputs.length - 1];
+    if (last) { last.scrollIntoView({ block: "center" }); if (!name) last.focus(); }
+  }
+
+  // Tiere aus der Sure-Cloud anbieten, die noch keinen Eintrag haben
+  function addCat() {
+    var have = S.draft.cats.map(function (c) { return c.name.trim().toLowerCase(); });
+    var names = ((S.status && S.status.pets) || []).map(function (p) { return p.name; })
+      .filter(function (n) { return have.indexOf(n.trim().toLowerCase()) < 0; });
+    if (!names.length) { addCatNamed(""); return; }
+    S.sheet = { kind: "pickpet", names: names };
+    render();
+  }
+
+  function setCatMode(i, mode) {
+    var c = S.draft.cats[i], cur = L.catMode(c);
+    if (mode === cur) return;
+    if (cur === "weekly") c._stash = c.rules;
+    if (mode === "daily") {
+      if (cur === "weekly" && c.rules.length) { c.lock = c.rules[0].lock; c.unlock = c.rules[0].unlock; }
+      delete c.rules;
+    } else if (mode === "weekly") {
+      c.rules = c._stash && c._stash.length ? c._stash : [{ days: [0, 1, 2, 3, 4, 5, 6], lock: c.lock, unlock: c.unlock }];
+    } else {
+      c.rules = [];
+    }
+    render(true);
+  }
+
+  function toggleDay(i, j, day) {
+    var r = S.draft.cats[i].rules[j], at = r.days.indexOf(day);
+    if (at >= 0) r.days.splice(at, 1); else { r.days.push(day); r.days.sort(function (a, b) { return a - b; }); }
+    render(true);
+  }
+  function daysPreset(i, j, preset) {
+    S.draft.cats[i].rules[j].days = preset === "week" ? [0, 1, 2, 3, 4] : preset === "weekend" ? [5, 6] : [0, 1, 2, 3, 4, 5, 6];
+    render(true);
+  }
+
+  // Zeit-Auswahl (Art / Versatz) geaendert
+  function changeWhen(t) {
+    var cat = S.draft.cats[+t.dataset.idx], target = t.dataset.rule != null ? cat.rules[+t.dataset.rule] : cat;
+    var f = t.dataset.field, cur = target[f];
+    if (t.dataset.when === "kind") {
+      target[f] = t.value === "clock" ? (L.whenKind(cur) === "clock" ? cur : (f === "lock" ? "22:00" : "06:30")) : L.whenWith(t.value, 0);
+      if (t.value !== "clock" && !S.draft.location) S.draft.location = { lat: 52.52, lon: 13.405, label: "Berlin" };
+    } else {
+      target[f] = L.whenWith(L.whenKind(cur), parseInt(t.value, 10) || 0);
+    }
+    var id = t.id;
+    render(true);
+    var again = id && document.getElementById(id);
+    if (again) again.focus();
+  }
+
+  function addVacation() {
+    var f = S.vacForm || newVacForm();
+    var v = { id: L.newVacationId(), from: f.from, to: f.to || f.from, state: f.state, cats: f.cats.slice(), note: (f.note || "").trim() };
+    if (!L.isDate(v.from)) { S.vacError = "Bitte den ersten Tag wählen."; render(true); return; }
+    if (!L.isDate(v.to) || v.to < v.from) { S.vacError = "Das Ende darf nicht vor dem Beginn liegen."; render(true); return; }
+    S.vacError = "";
+    S.draft.vacations.push(v);
+    S.vacForm = newVacForm();
+    render(true);
+  }
+
+  function useGps() {
+    if (!navigator.geolocation) { toast("Dieses Gerät kann den Standort nicht ermitteln."); return; }
+    toast("Standort wird ermittelt …");
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      S.draft.location = L.normalizeLocation({ lat: Math.round(pos.coords.latitude * 100) / 100, lon: Math.round(pos.coords.longitude * 100) / 100, label: "Mein Standort" });
+      toast("Standort übernommen. Zum Übernehmen noch speichern.");
+      if (S.tab === "times") render(true);
+    }, function () {
+      toast("Der Standort war nicht verfügbar. Bitte einen Ort aus der Liste wählen.");
+    }, { timeout: 12000, maximumAge: 600000 });
+  }
+
+  function askRemove(i) {
+    var c = S.draft.cats[i];
+    S.sheet = {
+      kind: "confirm", action: { type: "remove", idx: i },
+      title: (c.name.trim() || "Dieses Tier") + " entfernen?",
+      text: "Das Tier wird nicht mehr automatisch gesperrt oder freigegeben. Eine gerade aktive Sperre bleibt bestehen, bis du sie in der Sure-App aufhebst. Gespeichert wird erst mit „Änderungen speichern“.",
+      confirmLabel: "Entfernen"
+    };
+    render();
+  }
+
+  $app.addEventListener("click", function (ev) {
     var el = ev.target.closest("[data-action]");
     if (!el) return;
-    var a = el.getAttribute("data-action"), ds = el.dataset;
-    if (a === "scrim") { if (ev.target === el) closeSheet(); return; }
+    if (el.classList.contains("scrim") && ev.target !== el) return; // Klick im Dialog selbst schließt nicht
+    var a = el.dataset.action;
+    if (a !== "close-sheet" || ev.target.closest(".opt")) buzz(10);
     switch (a) {
-      case "tab": S.tab = ds.tab; if (S.tab === "year") S.year = S.y; render(); break;
-      case "prev-month": goMonth(-1); rerender(); break;
-      case "next-month": goMonth(1); rerender(); break;
-      case "prev-year": S.year--; rerender(); break;
-      case "next-year": S.year++; rerender(); break;
-      case "today": setToday(); S.y = +S.today.slice(0, 4); S.m = +S.today.slice(5, 7); S.year = S.y; S.sel = S.today; rerender(); break;
-      case "pick-day":
-        S.sel = ds.date; S.y = +ds.date.slice(0, 4); S.m = +ds.date.slice(5, 7); rerender(); break;
-      case "open-month": S.y = +ds.y; S.m = +ds.m; selectDefault(); S.tab = "month"; render(); break;
-      case "new-event": eventSheet(null, S.tab === "month" ? S.sel : S.today); break;
-      case "edit-event": eventSheet(ds.id, ds.date); break;
-      case "save-event": saveEvent(ds.id); break;
-      case "save-template": saveTemplate(); break;
-      case "use-template": {
-        var t = S.data.templates.filter(function (x) { return x.id === ds.id; })[0];
-        if (t) fillEventForm(t);
+      case "look-open": S.sheet = { kind: "look", name: el.dataset.name }; render(); break;
+      case "look-coat": case "look-toggle": {
+        var lsh = S.sheet; if (!lsh || lsh.kind !== "look") return;
+        var key = lsh.name.trim().toLowerCase(), cur = lookOf(lsh.name), next = { coat: cur.coat, tabby: cur.tabby, muzzle: cur.muzzle };
+        if (a === "look-coat") next.coat = el.dataset.color; else next[el.dataset.prop] = !next[el.dataset.prop];
+        S.looks[key] = L.normalizeLook(next, cur);
+        saveLooks();
+        render();
         break;
       }
-      case "delete-event":
-        if (!el.dataset.armed) { el.dataset.armed = "1"; el.textContent = "Wirklich löschen? Nochmal tippen"; break; }
-        S.data.events = S.data.events.filter(function (e) { return e.id !== ds.id; });
-        save(); closeSheet(); rerender(); toast("Termin gelöscht."); break;
-      case "close-sheet": closeSheet(); break;
-      case "confirm-ok": { var cb = S.confirmCb; S.confirmCb = null; if (cb) cb(); break; }
-      case "shift-sheet": shiftSheet(ds.date); break;
-      case "set-shift":
-        if (ds.v === "plan") delete S.data.overrides[ds.date]; else S.data.overrides[ds.date] = ds.v;
-        save(); closeSheet(); rerender(); break;
-      case "theme": T.set(ds.v); rerender(); break;
-      case "this-week":
-        S.data.shift.anchorMonday = L.mondayOf(S.today); S.data.shift.anchorType = ds.v; save(); rerender(); toast("Schichtplan angepasst."); break;
-      case "toggle-day": {
-        var n = +ds.v, days = S.data.shift.days.slice(), i = days.indexOf(n);
-        if (i >= 0) days.splice(i, 1); else days.push(n);
-        S.data.shift.days = days.sort(); save(); rerender(); break;
-      }
-      case "add-birthday": birthdaySheet(); break;
-      case "save-birthday": {
-        var bd = L.normalizeBirthday({ name: sheetVal("bd-name"), day: sheetVal("bd-day"), month: sheetVal("bd-month"), year: sheetVal("bd-year") });
-        if (!bd) { sheetErr("Bitte Namen, Tag und Monat prüfen."); break; }
-        S.data.birthdays.push(bd); save(); closeSheet(); rerender(); toast("Geburtstag gespeichert."); break;
-      }
-      case "del-birthday":
-        S.data.birthdays = S.data.birthdays.filter(function (b) { return b.id !== ds.id; }); save();
-        S.keepScroll = true; render(); var d = $("details.help[open]"); break;
-      case "del-template":
-        S.data.templates = S.data.templates.filter(function (t2) { return t2.id !== ds.id; }); save(); rerender(); break;
-      case "export-backup": exportBackup(); break;
-      case "wipe":
-        confirmSheet({ title: "Alle Daten löschen?", text: "Schichtplan, Termine, Geburtstage und Vorlagen werden von diesem Handy gelöscht. Das lässt sich nicht rückgängig machen. Besser vorher eine Sicherung speichern.", ok: "Alles löschen", danger: true, onOk: function () {
-          S.data = L.emptyData(); save(); closeSheet(); S.tab = "month"; render(); toast("Alle Daten gelöscht.");
-        } });
+      case "nav":
+        S.tab = el.dataset.tab; render(true); window.scrollTo(0, 0); break;
+      case "goto-times": S.tab = "times"; render(true); window.scrollTo(0, 0); break;
+      case "goto-more": S.tab = "more"; render(true); window.scrollTo(0, 0); break;
+      case "refresh": refresh(false); break;
+      case "retry-times": S.scheduleError = null; render(); break;
+      case "hist-filter": S.histFilter = el.dataset.name || null; S.histShown = 30; render(true); break;
+      case "hist-more": S.histShown += 30; render(true); break;
+      case "run-now": runNow(); break;
+      case "open-sheet": {
+        var name = el.dataset.name, wantLocked = el.dataset.locked === "1";
+        var cat = catByName(S.status, name);
+        if (!cat) return;
+        S.sheet = { kind: "override", name: name, wantLocked: wantLocked, options: L.overrideOptions(cat, clockNaive(), wantLocked) };
+        render();
         break;
-      case "apply-import": if (S.importItems) { var it = S.importItems; S.importItems = null; applyImport(it); } break;
-      default: break;
+      }
+      case "choose": {
+        var sh = S.sheet; if (!sh) return;
+        var opt = sh.options[+el.dataset.idx]; S.sheet = null;
+        changeOverride(sh.name, sh.wantLocked, opt.until);
+        break;
+      }
+      case "confirm-yes": {
+        var act = S.sheet && S.sheet.action; S.sheet = null;
+        if (act && act.type === "remove") { S.draft.cats.splice(act.idx, 1); render(true); }
+        else if (act && act.type === "logout") { logout(); }
+        else render();
+        break;
+      }
+      case "close-sheet": S.sheet = null; render(); break;
+      case "clear-override": removeOverride(el.dataset.name); break;
+      case "dismiss-pending": delete S.pending[el.dataset.key]; render(true); if (S.tab !== "times") refresh(true); break;
+      case "add-cat": addCat(); break;
+      case "choose-pet": {
+        var sp = S.sheet; if (!sp) return;
+        var pi = +el.dataset.idx, nm = pi >= 0 ? sp.names[pi] : ""; S.sheet = null;
+        addCatNamed(nm);
+        break;
+      }
+      case "open-bulk": {
+        var bl = el.dataset.locked === "1";
+        S.sheet = { kind: "bulk", wantLocked: bl, options: L.bulkChoices(bl) };
+        render();
+        break;
+      }
+      case "choose-bulk": {
+        var sb = S.sheet; if (!sb) return;
+        var ob = sb.options[+el.dataset.idx]; S.sheet = null;
+        changeBulk(sb.wantLocked, ob.key);
+        break;
+      }
+      case "clear-all-overrides": clearAllOverrides(); break;
+      case "cat-mode": setCatMode(+el.dataset.idx, el.dataset.mode); break;
+      case "toggle-day": toggleDay(+el.dataset.idx, +el.dataset.rule, +el.dataset.day); break;
+      case "days-preset": daysPreset(+el.dataset.idx, +el.dataset.rule, el.dataset.preset); break;
+      case "add-rule": {
+        var cr = S.draft.cats[+el.dataset.idx];
+        cr.rules.push(L.newRule());
+        render(true);
+        break;
+      }
+      case "remove-rule": {
+        var cr2 = S.draft.cats[+el.dataset.idx];
+        cr2.rules.splice(+el.dataset.rule, 1);
+        render(true);
+        break;
+      }
+      case "vac-cat": {
+        var f = S.vacForm || (S.vacForm = newVacForm()), nmv = el.dataset.name;
+        if (!nmv) f.cats = [];
+        else { var at = f.cats.indexOf(nmv); if (at >= 0) f.cats.splice(at, 1); else f.cats.push(nmv); }
+        render(true);
+        break;
+      }
+      case "vac-state": (S.vacForm || (S.vacForm = newVacForm())).state = el.dataset.state; render(true); break;
+      case "add-vac": addVacation(); break;
+      case "remove-vac": S.draft.vacations.splice(+el.dataset.idx, 1); render(true); break;
+      case "geolocate": useGps(); break;
+      case "remove-cat": askRemove(+el.dataset.idx); break;
+      case "save-times": saveTimes(); break;
+      case "palette":
+        if (window.KLTheme && window.KLTheme.setPalette) { window.KLTheme.setPalette(el.dataset.id); render(true); var pb = $app.querySelector('.pal-btn[aria-pressed="true"]'); if (pb) pb.focus(); }
+        break;
+      case "style":
+        if (window.KLTheme && window.KLTheme.setStyle) { window.KLTheme.setStyle(el.dataset.id); render(true); var sb = $app.querySelector('.style-btn[aria-pressed="true"]'); if (sb) sb.focus(); }
+        break;
+      case "diag": runDiag(); break;
+      case "lock-enable": lockEnable(); break;
+      case "lock-change": lockChange(); break;
+      case "lock-disable": lockDisable(); break;
+      case "lock-now": lockNow(); break;
+      case "share": share(); break;
+      case "copy-link": copyLink(); break;
+      case "install":
+        if (S.installEvt) { S.installEvt.prompt(); S.installEvt = null; render(); }
+        break;
+      case "hint-dismiss": lsSet(HINT_KEY, "1"); render(); break;
+      case "logout": if (S.demo) { logout(); } else { S.sheet = { kind: "confirm", action: { type: "logout" }, title: "Abmelden?", text: "Der Zugangsschlüssel wird von diesem Handy entfernt. Den Link zum Einrichten brauchst du dann noch einmal.", confirmLabel: "Abmelden" }; render(); } break;
+      case "demo": startDemo(); break;
+      case "connect-code": {
+        var cfg = L.decodeSetup(document.getElementById("code").value);
+        if (!cfg) { S.setupError = "Mit diesem Text kann ich nichts anfangen. Bitte den ganzen Link einfügen."; render(); return; }
+        tryConnect(cfg);
+        break;
+      }
+      case "connect-manual": {
+        var owner = document.getElementById("o").value.trim();
+        var repo = document.getElementById("r").value.trim();
+        var token = document.getElementById("t").value.trim();
+        if (repo.indexOf("/") > 0) { owner = repo.split("/")[0]; repo = repo.split("/")[1]; }
+        if (!owner || !repo || !token) { S.setupError = "Bitte Konto, Repository und Zugangsschlüssel ausfüllen."; render(); return; }
+        tryConnect({ owner: owner, repo: repo, token: token });
+        break;
+      }
     }
   });
 
-  document.addEventListener("change", function (ev) {
-    var t = ev.target, f = t.dataset && t.dataset.field;
-    if (t.id === "ev-allday") { document.getElementById("ev-times").hidden = t.checked; return; }
-    if (t.id === "ev-repeat") { document.getElementById("ev-until-wrap").hidden = t.value === "none"; return; }
-    if (!f) return;
-    if (f === "shift-enabled") { S.data.shift.enabled = t.checked; save(); rerender(); }
-    else if (f === "holidays-free") { S.data.shift.holidaysFree = t.checked; save(); rerender(); }
-    else if (f === "time") {
-      var k = t.dataset.k, p = t.dataset.p;
-      if (L.isTime(t.value)) { S.data.shift.times[k][p] = t.value; save(); }
-      else { t.value = S.data.shift.times[k][p]; toast("Bitte eine gültige Uhrzeit wählen."); }
-    } else if (f === "import-contacts") {
-      var file = t.files && t.files[0]; t.value = "";
-      readFile(file, function (text, name) {
-        var res = L.parseContacts(text, name);
-        if (!res.items.length) {
-          toast(res.kind === "unknown" ? "Diese Datei kenne ich nicht. Gebraucht wird eine vCard (.vcf) oder CSV aus Google Kontakte." : "In der Datei stehen keine Geburtstage.");
-          return;
-        }
-        S.importItems = res.items;
-        var sample = res.items.slice(0, 3).map(function (i2) { return i2.name; }).join(", ");
-        var existing = S.data.birthdays.filter(function (b) { return b.source === "import"; }).length;
-        openSheet('<h2 id="sheet-title">' + res.items.length + " Geburtstage gefunden</h2><p style=\"margin-bottom:14px;color:var(--ink-2)\">Zum Beispiel: " + esc(sample) + "." +
-          (existing ? " Frühere Importe (" + existing + ") werden ersetzt, von Hand eingetragene bleiben." : "") + '</p><div class="actions"><button class="btn" data-action="apply-import">Importieren</button><button class="btn ghost" data-action="close-sheet">Abbrechen</button></div>', '[data-action="apply-import"]');
-      });
-    } else if (f === "import-backup") {
-      var file2 = t.files && t.files[0]; t.value = "";
-      readFile(file2, function (text) {
-        var res = L.parseBackup(text);
-        if (!res.ok) { toast(res.error); return; }
-        confirmSheet({ title: "Sicherung zurückspielen?", text: "Die Sicherung enthält " + res.data.events.length + " Termine, " + res.data.birthdays.length + " Geburtstage und " + res.data.templates.length + " Vorlagen. Die aktuellen Daten auf diesem Handy werden ersetzt.", ok: "Zurückspielen", danger: true, onOk: function () {
-          S.data = res.data; save(); closeSheet(); render(); toast("Sicherung zurückgespielt.");
-        } });
-      });
+  $app.addEventListener("input", function (ev) {
+    var t = ev.target, ds = t.dataset || {};
+    if (!S.draft) return;
+    if (ds.vac) {
+      var f2 = S.vacForm || (S.vacForm = newVacForm());
+      f2[ds.vac] = t.value;
+      if (ds.vac === "from") { var to = document.getElementById("vac-to"); if (to) to.min = t.value || clockNaive().slice(0, 10); }
+      return;
+    }
+    if (ds.locfield) {
+      var v = parseFloat(t.value);
+      S.draft.location = Object.assign({}, S.draft.location || {}, { label: "Eigene Koordinaten" });
+      S.draft.location[ds.locfield] = isNaN(v) ? "" : v;
+      updateScheduleUi();
+      return;
+    }
+    var f = ds.field;
+    if (!f || f === "enabled" || ds.when) return;
+    var cat = S.draft.cats[+ds.idx];
+    (ds.rule != null ? cat.rules[+ds.rule] : cat)[f] = t.value;
+    updateScheduleUi();
+  });
+  $app.addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (t.dataset && t.dataset.themeMode) {
+      if (window.KLTheme) window.KLTheme.setMode(t.value);
+      render(true);
+      var tm = document.getElementById("theme-mode");
+      if (tm) tm.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.motionMode) {
+      if (window.KLTheme && window.KLTheme.setMotion) window.KLTheme.setMotion(t.value);
+      render(true);
+      var mm = document.getElementById("motion-mode");
+      if (mm) mm.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.lockAfter) {
+      if (window.KLLock) window.KLLock.setAfter(parseInt(t.value, 10) || 0);
+      return;
+    }
+    if (t.dataset && t.dataset.haptics) {
+      S.haptics = !!t.checked;
+      lsSet(HAPTIC_KEY, S.haptics ? "1" : "0");
+      buzz(20);
+      return;
+    }
+    if (t.dataset && t.dataset.when && S.draft) { changeWhen(t); return; }
+    if (t.dataset && t.dataset.loc === "city" && S.draft) {
+      var val = t.value;
+      if (val === "none") S.draft.location = null;
+      else if (val === "custom") S.draft.location = L.normalizeLocation({ lat: (S.draft.location || { lat: 52.52 }).lat, lon: (S.draft.location || { lon: 13.405 }).lon, label: "Eigene Koordinaten" });
+      else if (val === "gps") { useGps(); return; }
+      else { var c = CITIES[+val.slice(1)]; S.draft.location = { lat: c[1], lon: c[2], label: c[0] }; }
+      render(true);
+      var again = document.getElementById("loc-city");
+      if (again) again.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.alert && S.draft) {
+      var key = t.dataset.alert, id = t.id;
+      S.draft.alerts[key] = key === "enabled" ? !!t.checked : parseInt(t.value, 10) || 0;
+      S.draft.alerts = L.normalizeAlerts(S.draft.alerts);
+      render(true);
+      var again = id && document.getElementById(id);
+      if (again) again.focus();
+      return;
+    }
+    if (t.dataset && t.dataset.field === "enabled" && S.draft) {
+      S.draft.enabled = t.checked;
+      updateScheduleUi();
     }
   });
 
   document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape" && S.sheetOpen) { closeSheet(); return; }
-    if (ev.key === "Tab" && S.sheetOpen) {   // Tab bleibt im Fenster
-      var root = document.getElementById("sheet-root");
-      var els = [].slice.call(root.querySelectorAll("button, input, select, textarea, [href]")).filter(function (e) { return !e.disabled && e.offsetParent !== null; });
-      if (!els.length) return;
-      var first = els[0], last = els[els.length - 1];
-      if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
-      else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
-    }
-    if (ev.key === "Enter" && S.sheetOpen && ev.target && ev.target.id === "ev-title") { ev.preventDefault(); var b = $('[data-action="save-event"]'); if (b) b.click(); }
+    if (ev.key === "Escape" && S.sheet) { S.sheet = null; render(); }
   });
 
-  // Wischen im Monat: links = naechster, rechts = voriger Monat
-  var tx = 0, ty = 0, tOn = false;
-  document.addEventListener("touchstart", function (e) {
-    tOn = S.tab === "month" && !S.sheetOpen && !!e.target.closest(".dow, .wk");
-    if (tOn && e.touches.length === 1) { tx = e.touches[0].clientX; ty = e.touches[0].clientY; } else tOn = false;
-  }, { passive: true });
-  document.addEventListener("touchend", function (e) {
-    if (!tOn) return; tOn = false;
-    var t = e.changedTouches[0], dx = t.clientX - tx, dy = t.clientY - ty;
-    if (Math.abs(dx) > 70 && Math.abs(dy) < 40) { goMonth(dx < 0 ? 1 : -1); rerender(); }
-  }, { passive: true });
-
+  window.addEventListener("online", function () { S.online = true; render(); refresh(true); });
+  window.addEventListener("offline", function () { S.online = false; render(); });
+  window.addEventListener("beforeinstallprompt", function (ev) { ev.preventDefault(); S.installEvt = ev; render(); });
+  window.addEventListener("appinstalled", function () { S.installEvt = null; lsSet(HINT_KEY, "1"); render(); });
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible" && setToday() && !S.sheetOpen) { if (S.y === 0) return; rerender(); }
+    if (document.hidden) { S.lock.hiddenAt = Date.now(); return; }
+    maybeLock();
+    if (!document.hidden && window.KLTheme) window.KLTheme.apply();
+    if (!document.hidden && S.api && (!S.fetchedAt || Date.now() - S.fetchedAt > 30000)) refresh(true);
   });
+  setInterval(function () {
+    if (window.KLTheme && !document.hidden) window.KLTheme.apply();
+    if (document.hidden || !S.api) return;
+    if ((S.tab === "home" || S.tab === "history") && !S.sheet) {
+      if (!S.fetchedAt || Date.now() - S.fetchedAt > 300000) refresh(true); else render();
+    }
+  }, 60000);
 
   /* ---------- Start ---------- */
-  function boot() {
-    load(); setToday();
-    S.y = +S.today.slice(0, 4); S.m = +S.today.slice(5, 7); S.year = S.y; S.sel = S.today;
-    render();
-    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* egal */ }
-    if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
-      window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () { /* egal */ }); });
+
+  // Einrichtungs-Link (#setup=...) oder Demo (#demo) in der Adresse. Gibt true zurück, wenn etwas zu tun war.
+  async function handleHash() {
+    var hash = location.hash || "";
+    if (/[#&]setup=/.test(hash)) {
+      var cfg = L.decodeSetup(hash);
+      history.replaceState(null, "", location.pathname + location.search);
+      if (!cfg) {
+        S.setupError = "Der Einrichtungs-Link ist unvollständig. Bitte noch einmal den ganzen Link öffnen.";
+        if (!S.cfg) render();
+        return true;
+      }
+      render();
+      await tryConnect(cfg);
+      return true;
     }
+    var sc = /^#(lockall|freeall|history|times|home)$/.exec(hash);
+    if (sc) {
+      history.replaceState(null, "", location.pathname + location.search);
+      S.shortcut = sc[1];
+      if (S.cfg && S.api) { applyShortcut(); return true; }
+      return false; // noch nicht verbunden: nach dem Start anwenden
+    }
+    if (/^#demo/.test(hash)) {
+      history.replaceState(null, "", location.pathname + location.search);
+      await startDemo();
+      return true;
+    }
+    return false;
   }
-  window.KalApp = { state: S };   // fuer Tests
+
+  // Kurzbefehle vom Startbildschirm (#lockall, #freeall, #history, #times): oeffnen nur den Dialog bzw. Reiter
+  function applyShortcut() {
+    var name = S.shortcut; S.shortcut = null;
+    if (!name || !S.cfg) return;
+    if (name === "lockall" || name === "freeall") {
+      S.tab = "home";
+      if (((S.status && S.status.cats) || []).length) {
+        var bl = name === "lockall";
+        S.sheet = { kind: "bulk", wantLocked: bl, options: L.bulkChoices(bl) };
+      }
+    } else {
+      S.tab = name;
+    }
+    render(true);
+    window.scrollTo(0, 0);
+  }
+
+  async function boot() {
+    if (await handleHash()) return;
+    var stored = loadCfg();
+    if (stored) {
+      var go = async function () { await startApp(stored, new L.GitHub(stored), false); applyShortcut(); };
+      if (window.KLLock && window.KLLock.has()) { showLockScreen(stored, go); return; }
+      await go();
+      return;
+    }
+    render();
+  }
+
+  window.addEventListener("hashchange", function () { handleHash(); });
+
+  if ("serviceWorker" in navigator && location.protocol.indexOf("http") === 0) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () { /* ohne Offline-Hülle weiter */ });
+    });
+  }
+
+  window.KLApp = { state: S, render: render };
   boot();
 })();
